@@ -45,8 +45,8 @@ def cli():
               type=click.Choice(['analyze_architecture', 'historical_analysis', 'onboarding',
                                 'refactoring_guide', 'dependency_analysis']),
               help='Analysis task to perform')
-@click.option('--model', '-m', default='llama-4-10m',
-              help='Llama model to use (e.g., llama-4-10m, llama-4-1m)')
+@click.option('--model', '-m', default='Llama-4-Maverick-17B-128E-Instruct-FP8',
+              help='Llama model to use (e.g.,Llama-4-Maverick-17B-128E-Instruct-FP8,-, llama-4-1m)')
 @click.option('--include-issues', is_flag=True, help='Include issues in analysis')
 @click.option('--include-prs', is_flag=True, help='Include pull requests in analysis')
 @click.option('--max-history', type=int, help='Maximum number of commits to analyze')

@@ -154,7 +154,7 @@ class LlamaClient:
     def analyze_repository(
         self,
         content: str,
-        model: str,
+        model: str = "llama-2-70b-chat",  # Updated to standard model name
         temperature: float = 0.7,
         max_tokens: int = 2000,
         task: str = "analyze_architecture",
@@ -330,7 +330,7 @@ class LlamaClient:
     
     def chunk_and_analyze(self, 
                          content: str,
-                         model: str = "Llama-4-Maverick-17B-128E-Instruct-FP8",
+                         model: str = "llama-2-70b-chat",  # Updated to standard model name
                          chunk_size: int = 100000,
                          overlap: int = 5000,
                          task: str = "analyze_architecture") -> List[Dict[str, Any]]:

@@ -136,7 +136,7 @@ class RepositoryAnalyzer:
     def analyze_repository(self,
                           context: str,
                           task: str = "analyze_architecture",
-                          model: str = "llama-4-10m") -> Dict[str, Any]:
+                          model: str = "llama-2-70b-chat") -> Dict[str, Any]:
         """
         Analyze a repository using Llama 4.
         
@@ -148,44 +148,16 @@ class RepositoryAnalyzer:
         Returns:
             Analysis results
         """
-        # Log the context size
-        logger.info(f"Analyzing repository with context size: {len(context)} characters")
+        logger.debug(f"Analyzing repository with context size: {len(context)} characters")
         
-        # Check if context is too large for a single request
-        if len(context) > 300000:  # Assuming 300K chars is our limit
-            logger.info("Context too large, chunking and analyzing separately")
-            results = self.llm_client.chunk_and_analyze(
-                context,
-                model=model,
-                task=task
-            )
-            
-            # Save intermediate results if output_dir is specified
-            if self.output_dir:
-                chunks_dir = self.output_dir / "chunks"
-                chunks_dir.mkdir(exist_ok=True)
-                
-                for i, result in enumerate(results):
-                    chunk_file = chunks_dir / f"chunk_{i+1}_analysis.json"
-                    with open(chunk_file, 'w') as f:
-                        json.dump(result, f, indent=2)
-            
-            # Combine results
-            combined_analysis = self._combine_chunked_analyses(results, task)
-            
-            # Save combined results
-            if self.output_dir:
-                combined_file = self.output_dir / f"{task}_analysis.json"
-                with open(combined_file, 'w') as f:
-                    json.dump(combined_analysis, f, indent=2)
-            
-            return combined_analysis
-        else:
-            # Analyze in a single request
+        try:
+            # Send the context to Llama for analysis
             result = self.llm_client.analyze_repository(
                 context,
                 model=model,
-                task=task
+                task=task,
+                temperature=0.2,  # Lower temperature for more focused responses
+                max_tokens=1000   # Limit response length
             )
             
             # Save result if output_dir is specified
@@ -195,6 +167,9 @@ class RepositoryAnalyzer:
                     json.dump(result, f, indent=2)
             
             return result
+        except Exception as e:
+            logger.error(f"Error analyzing repository: {e}")
+            return {}
     
     def _combine_chunked_analyses(self, 
                                  results: List[Dict[str, Any]], 

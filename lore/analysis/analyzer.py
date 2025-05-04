@@ -39,7 +39,8 @@ class RepositoryAnalyzer:
                               repo_owner: Optional[str] = None,
                               repo_name: Optional[str] = None,
                               include_issues: bool = False,
-                              include_prs: bool = False) -> str:
+                              include_prs: bool = False,
+                              additional_resources: Optional[Dict[str, str]] = None) -> str:
         """
         Prepare the repository context for analysis.
         
@@ -50,6 +51,7 @@ class RepositoryAnalyzer:
             repo_name: Repository name (for issue extraction)
             include_issues: Whether to include issues
             include_prs: Whether to include pull requests
+            additional_resources: Dictionary containing additional resources (documentation, PRDs, meeting notes)
             
         Returns:
             Repository context as a string
@@ -59,6 +61,21 @@ class RepositoryAnalyzer:
         # Add repository information
         context_parts.append("# REPOSITORY ANALYSIS CONTEXT\n\n")
         context_parts.append(f"Repository path: {git_extractor.repo_path}\n\n")
+        
+        # Add file structure section with source information
+        context_parts.append("## FILE STRUCTURE OVERVIEW\n\n")
+        file_extension_counts = {}
+        for path in git_extractor.get_file_contents().keys():
+            ext = Path(path).suffix
+            file_extension_counts[ext] = file_extension_counts.get(ext, 0) + 1
+        
+        context_parts.append("File types summary:\n")
+        for ext, count in sorted(file_extension_counts.items(), key=lambda x: x[1], reverse=True):
+            if ext:
+                context_parts.append(f"- {ext}: {count} files\n")
+            else:
+                context_parts.append(f"- (no extension): {count} files\n")
+        context_parts.append("\n")
         
         # Get commit history - get all commits
         commits = git_extractor.get_commit_history()
@@ -99,20 +116,69 @@ class RepositoryAnalyzer:
             reverse=True
         )
         
-        context_parts.append(f"## KEY SOURCE FILES ({len(important_files)} files)\n\n")
-        for file_path, content in sorted_files[:10]:  # Only include top 10 files
-            file_changes = changed_files.get(file_path, [])
-            context_parts.append(f"### {file_path}\n")
+        # Add important files with source attributions
+        context_parts.append("## IMPORTANT FILES (Sources: Code)\n\n")
+        for i, (path, content) in enumerate(sorted_files[:20]):  # Include up to 20 important files
+            file_changes = changed_files.get(path, [])
+            change_summary = ""
             if file_changes:
-                context_parts.append("\nRecent changes:\n")
-                for change in file_changes[:3]:  # Show last 3 changes
-                    context_parts.append(
-                        f"- [{change['hash']}] {change['message']} "
-                        f"(+{change['insertions']}, -{change['deletions']})\n"
-                    )
-            context_parts.append(f"\n```\n{content}\n```\n\n")
+                total_insertions = sum(c['insertions'] for c in file_changes)
+                total_deletions = sum(c['deletions'] for c in file_changes)
+                change_summary = f" ({len(file_changes)} changes, +{total_insertions}/-{total_deletions})"
+            
+            context_parts.append(f"### {path}{change_summary}\n\n")
+            
+            # Add a snippet of the file content - truncate if too long
+            if len(content) > 10000:
+                content = content[:10000] + "\n... (truncated)\n"
+            context_parts.append(f"```\n{content}\n```\n\n")
         
-        context_parts.append(f"## RECENT SIGNIFICANT COMMITS ({len(significant_commits)} commits)\n\n")
+        # Add documentation with source attribution
+        documentation = git_extractor.get_documentation()
+        if documentation:
+            context_parts.append("## DOCUMENTATION FILES (Sources: Documentation)\n\n")
+            for doc_path, content in documentation.items():
+                context_parts.append(f"### {doc_path}\n\n")
+                if len(content) > 10000:
+                    content = content[:10000] + "\n... (truncated)\n"
+                context_parts.append(f"{content}\n\n")
+        
+        # Add issues and PRs if requested
+        if include_issues and issue_extractor and repo_owner and repo_name:
+            issues = issue_extractor.get_issues(repo_owner, repo_name, max_issues=20)
+            if issues:
+                context_parts.append("\n## REPOSITORY ISSUES (Sources: Issues)\n\n")
+                for issue in issues:
+                    title = issue.get('title', 'No title')
+                    number = issue.get('number', 0)
+                    state = issue.get('state', 'unknown')
+                    body = issue.get('body', 'No description')
+                    if len(body) > 1000:  # Truncate long issue descriptions
+                        body = body[:1000] + "..."
+                    
+                    context_parts.append(f"### Issue #{number}: {title} ({state})\n\n")
+                    context_parts.append(f"{body}\n\n")
+        
+        # Add additional resources if provided
+        if additional_resources:
+            if additional_resources.get('documentation'):
+                context_parts.append("## EXTERNAL DOCUMENTATION (Sources: External Documentation)\n\n")
+                context_parts.append(f"{additional_resources['documentation']}\n\n")
+            
+            if additional_resources.get('product_requirements'):
+                context_parts.append("## PRODUCT REQUIREMENTS (Sources: PRD)\n\n")
+                context_parts.append(f"{additional_resources['product_requirements']}\n\n")
+            
+            if additional_resources.get('meeting_notes'):
+                context_parts.append("## MEETING NOTES (Sources: Meetings)\n\n")
+                context_parts.append(f"{additional_resources['meeting_notes']}\n\n")
+            
+            if additional_resources.get('additional_context'):
+                context_parts.append("## ADDITIONAL CONTEXT (Sources: Additional Context)\n\n")
+                context_parts.append(f"{additional_resources['additional_context']}\n\n")
+        
+        # Add recent significant commits
+        context_parts.append("## RECENT SIGNIFICANT COMMITS (Sources: Commit History)\n\n")
         for commit in significant_commits[:10]:  # Only include top 10 significant commits
             context_parts.append(
                 f"### Commit {commit['hash'][:8]}\n\n"
@@ -149,41 +215,7 @@ class RepositoryAnalyzer:
             
             context_parts.append(f"\nTotal: +{commit['insertions']}, -{commit['deletions']} lines\n\n")
         
-        # Get documentation - only README and key docs
-        documentation = git_extractor.get_documentation()
-        key_docs = {
-            path: content for path, content in documentation.items()
-            if path.lower() in ['readme.md', 'contributing.md', 'architecture.md', 'design.md']
-            or 'architecture' in path.lower()
-            or 'design' in path.lower()
-        }
-        
-        if key_docs:
-            context_parts.append(f"## KEY DOCUMENTATION ({len(key_docs)} files)\n\n")
-            for doc_path, content in key_docs.items():
-                # Truncate very long docs
-                if len(content) > 10000:
-                    content = content[:10000] + "\n... (truncated)\n"
-                context_parts.append(f"### {doc_path}\n\n{content}\n\n")
-        
-        # Get issues and PRs if requested - only recent important ones
-        if include_issues and issue_extractor and repo_owner and repo_name:
-            try:
-                issues = issue_extractor.get_issues(repo_owner, repo_name, max_issues=10)
-                if issues:
-                    context_parts.append(f"## RECENT ISSUES ({len(issues)} issues)\n\n")
-                    for issue in issues:
-                        # Only include title and first paragraph of description
-                        description = issue['body'].split('\n\n')[0] if issue['body'] else ''
-                        context_parts.append(
-                            f"### {issue['title']}\n\n"
-                            f"State: {issue['state']}\n"
-                            f"Created: {issue['created_at']}\n"
-                            f"{description}\n\n"
-                        )
-            except Exception as e:
-                logger.warning(f"Error fetching issues: {e}")
-        
+        # Combine all parts into a single context
         return "\n".join(context_parts)
     
     def analyze_repository(self,

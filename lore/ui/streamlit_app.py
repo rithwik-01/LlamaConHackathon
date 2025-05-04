@@ -25,6 +25,8 @@ from lore.ingestion.issue_extractor import IssueExtractor
 from lore.ui.chat_interface import RepoChat, ChatHistory
 from lore.utils.repo_utils import clone_github_repo, extract_repo_info
 from lore.utils.text_processing import extract_file_extension_stats, categorize_files, truncate_text
+from lore.utils.web_fetcher import fetch_url_content, is_valid_url
+from lore.utils.image_utils import format_image_for_llama
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -70,9 +72,29 @@ def init_session_state():
         'repo_owner': "",
         'repo_name': "",
         
+        # Additional resources
+        'documentation': "",
+        'product_requirements': "",
+        'meeting_notes': "",
+        'additional_context': "",
+        'use_additional_resources': False,
+        
+        # URL resources
+        'documentation_url': "",
+        'product_requirements_url': "",
+        'meeting_notes_url': "",
+        'use_url_resources': False,
+        
+        # Design diagram
+        'design_diagram': None,
+        'use_design_diagram': False,
+        'design_diagram_description': "",
+        
         # Repository context
         'repo_context': None,
-        'repo_chat': None
+        'repo_chat': None,
+        'chat_input_key': 0,
+        'current_chat_input': ""
     }
     
     # Initialize any missing state variables
@@ -184,6 +206,59 @@ def get_repository_path() -> Tuple[str, Optional[str], Optional[str]]:
 def analyze_repository():
     """Analyze the repository based on user input."""
     try:
+        st.session_state.analyzed = False
+        st.session_state.chat_initialized = False
+        
+        # Validate API key
+        if not st.session_state.api_key:
+            st.error("Please enter your Llama API key.")
+            return
+        
+        # Initialize LLM client
+        llm_client = LlamaClient(
+            api_key=st.session_state.api_key,
+            api_base=st.session_state.api_base
+        )
+        
+        # Get or create git extractor
+        git_extractor = st.session_state.git_extractor
+        
+        # Extract repo owner and name
+        repo_owner = None
+        repo_name = None
+        
+        if st.session_state.repo_source == "github" and st.session_state.github_url:
+            # Extract owner and repo name from GitHub URL
+            try:
+                repo_owner, repo_name = extract_repo_info(st.session_state.github_url)
+            except ValueError as e:
+                st.error(f"Invalid GitHub URL: {e}")
+                return
+        
+        # Initialize repository analyzer
+        analyzer = RepositoryAnalyzer(llm_client)
+        
+        # Save design diagram if uploaded
+        design_diagram_path = None
+        if st.session_state.use_design_diagram and st.session_state.design_diagram is not None:
+            try:
+                # Create a temporary directory for the image if it doesn't exist
+                if not hasattr(st.session_state, 'temp_image_dir') or not st.session_state.temp_image_dir:
+                    temp_image_dir = tempfile.mkdtemp(prefix="lore_diagram_")
+                    st.session_state.temp_image_dir = temp_image_dir
+                
+                # Save the uploaded file to the temporary directory
+                file_extension = Path(st.session_state.design_diagram.name).suffix
+                design_diagram_path = Path(st.session_state.temp_image_dir) / f"diagram{file_extension}"
+                
+                with open(design_diagram_path, "wb") as f:
+                    f.write(st.session_state.design_diagram.getbuffer())
+                
+                st.success(f"Design diagram saved: {design_diagram_path}")
+            except Exception as e:
+                st.error(f"Error saving design diagram: {e}")
+                design_diagram_path = None
+        
         # Get repository path based on source
         repo_path, repo_owner, repo_name = get_repository_path()
         
@@ -202,14 +277,59 @@ def analyze_repository():
             stats = extract_repo_stats(git_extractor)
             st.session_state.repo_stats = stats
         
-        # Initialize LLM client
-        llm_client = initialize_llm_client()
-        if not llm_client:
-            st.error("Failed to initialize LLM client. Please check your API key.")
-            return
+        # Prepare additional resources if enabled
+        additional_resources = None
+        if st.session_state.use_additional_resources:
+            additional_resources = {
+                'documentation': st.session_state.documentation,
+                'product_requirements': st.session_state.product_requirements,
+                'meeting_notes': st.session_state.meeting_notes,
+                'additional_context': st.session_state.additional_context
+            }
+            # Only include non-empty resources
+            additional_resources = {k: v for k, v in additional_resources.items() if v.strip()}
+            if not additional_resources:
+                additional_resources = None
+                st.warning("Additional resources enabled but no content provided.")
         
-        # Initialize repository analyzer
-        analyzer = RepositoryAnalyzer(llm_client)
+        # Process URL resources if enabled
+        if st.session_state.use_url_resources:
+            if additional_resources is None:
+                additional_resources = {}
+            
+            # Fetch documentation URL content
+            if st.session_state.documentation_url and is_valid_url(st.session_state.documentation_url):
+                with st.spinner(f"Fetching documentation from {st.session_state.documentation_url}..."):
+                    doc_content = fetch_url_content(st.session_state.documentation_url)
+                    if doc_content:
+                        additional_resources['documentation_from_url'] = f"URL: {st.session_state.documentation_url}\n\n{doc_content}"
+                        st.success(f"Successfully fetched documentation from URL")
+                    else:
+                        st.warning(f"Failed to fetch documentation from {st.session_state.documentation_url}")
+            
+            # Fetch product requirements URL content
+            if st.session_state.product_requirements_url and is_valid_url(st.session_state.product_requirements_url):
+                with st.spinner(f"Fetching product requirements from {st.session_state.product_requirements_url}..."):
+                    pr_content = fetch_url_content(st.session_state.product_requirements_url)
+                    if pr_content:
+                        additional_resources['product_requirements_from_url'] = f"URL: {st.session_state.product_requirements_url}\n\n{pr_content}"
+                        st.success(f"Successfully fetched product requirements from URL")
+                    else:
+                        st.warning(f"Failed to fetch product requirements from {st.session_state.product_requirements_url}")
+            
+            # Fetch meeting notes URL content
+            if st.session_state.meeting_notes_url and is_valid_url(st.session_state.meeting_notes_url):
+                with st.spinner(f"Fetching meeting notes from {st.session_state.meeting_notes_url}..."):
+                    notes_content = fetch_url_content(st.session_state.meeting_notes_url)
+                    if notes_content:
+                        additional_resources['meeting_notes_from_url'] = f"URL: {st.session_state.meeting_notes_url}\n\n{notes_content}"
+                        st.success(f"Successfully fetched meeting notes from URL")
+                    else:
+                        st.warning(f"Failed to fetch meeting notes from {st.session_state.meeting_notes_url}")
+            
+            # If we didn't end up adding any URL resources, check if additional_resources should be None
+            if not additional_resources:
+                additional_resources = None
         
         # Prepare repository context
         with st.spinner("Preparing repository context..."):
@@ -217,10 +337,9 @@ def analyze_repository():
             issue_extractor = None
             if st.session_state.include_issues or st.session_state.include_prs:
                 try:
+                    # IssueExtractor only takes platform and token arguments, not repo_owner/repo_name
                     issue_extractor = IssueExtractor(
-                        st.session_state.platform,
-                        repo_owner,
-                        repo_name
+                        platform=st.session_state.platform
                     )
                 except Exception as e:
                     st.warning(f"Could not initialize issue extractor: {e}")
@@ -232,7 +351,8 @@ def analyze_repository():
                 repo_owner,
                 repo_name,
                 st.session_state.include_issues,
-                st.session_state.include_prs
+                st.session_state.include_prs,
+                additional_resources
             )
             st.session_state.repo_context = context
         
@@ -251,7 +371,18 @@ def analyze_repository():
             
             # Initialize chat functionality
             if not st.session_state.chat_initialized:
-                st.session_state.repo_chat = RepoChat(llm_client, analyzer, context)
+                st.session_state.repo_chat = RepoChat(
+                    llm_client=llm_client,
+                    repository_context=st.session_state.repo_context,
+                    history=ChatHistory()
+                )
+                
+                # Set design diagram flag if applicable
+                if design_diagram_path and st.session_state.use_design_diagram:
+                    st.session_state.repo_chat.set_design_diagram(True)
+                    # Store the diagram path for use during chat
+                    st.session_state.design_diagram_path = str(design_diagram_path)
+                    
                 st.session_state.chat_initialized = True
         
         st.session_state.analyzed = True
@@ -261,35 +392,124 @@ def analyze_repository():
         logger.exception(f"Error during repository analysis: {e}")
         st.error(f"Error during repository analysis: {e}")
 
-def handle_chat():
-    """Handle chat interactions with the repository."""
-    if not st.session_state.chat_initialized or not st.session_state.repo_chat:
-        st.warning("Please analyze a repository first to enable chat functionality.")
+def chat_container():
+    """Display chat interface."""
+    if not st.session_state.analyzed or not st.session_state.chat_initialized:
+        st.warning("Please analyze a repository first.")
         return
     
-    # Display chat history
-    for message in st.session_state.chat_history:
-        if message["role"] == "user":
-            st.chat_message("user").write(message["content"])
-        else:
-            st.chat_message("assistant").write(message["content"])
+    # Container for messages
+    messages_container = st.container()
     
-    # Handle user input
-    if prompt := st.chat_input("Ask something about the repository..."):
-        # Add user message to chat display
-        st.chat_message("user").write(prompt)
+    # Initialize the chat_input_key to ensure we get a fresh widget after submission
+    if "chat_input_key" not in st.session_state:
+        st.session_state.chat_input_key = 0
         
-        # Add to history for display
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
+    # Helper function to handle message processing
+    def handle_message_submission():
+        chat_input_key = f"chat_input_{st.session_state.chat_input_key}"
+        if chat_input_key in st.session_state and st.session_state[chat_input_key]:
+            user_input = st.session_state[chat_input_key]
+            if user_input.strip():
+                # Store the message so we can process it after the rerun
+                st.session_state.pending_message = user_input.strip()
+                # Increment the key to get a fresh input field on next render
+                st.session_state.chat_input_key += 1
+    
+    # Process pending message if any
+    if hasattr(st.session_state, 'pending_message') and st.session_state.pending_message:
+        user_input = st.session_state.pending_message
+        # Clear the pending message
+        st.session_state.pending_message = ""
         
-        # Get response from chat interface
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = st.session_state.repo_chat.chat(prompt)
-                st.write(response)
+        # Display user message
+        with messages_container:
+            st.markdown(f"**You:** {user_input}")
+        
+        # Get response from repo chat
+        with st.spinner("Thinking..."):
+            try:
+                # Pass design diagram to chat if available
+                design_diagram_path = st.session_state.get('design_diagram_path')
                 
-                # Add to history for display
-                st.session_state.chat_history.append({"role": "assistant", "content": response})
+                if design_diagram_path and st.session_state.use_design_diagram:
+                    response = st.session_state.repo_chat.chat(user_input, design_diagram_path=design_diagram_path)
+                else:
+                    response = st.session_state.repo_chat.chat(user_input)
+                    
+                # Display assistant response
+                with messages_container:
+                    st.markdown(f"**LORE:** {response}")
+                    
+            except Exception as e:
+                st.error(f"Error: {e}")
+    
+    # Display chat history first (so new messages appear below it)
+    display_chat_history(messages_container)
+    
+    # Input area with custom styling
+    st.markdown("""
+        <style>
+        .stTextArea textarea {
+            font-size: 14px;
+        }
+        </style>
+        <script>
+        // Function to handle keyboard events in the chat input
+        const handleChatKeyPress = (e) => {
+            // Check if it's Enter without Shift
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                // Find the send button and click it
+                const sendButton = document.querySelector('button[data-testid^="send_button_"]');
+                if (sendButton) {
+                    sendButton.click();
+                }
+            }
+        };
+        
+        // Wait for the DOM to be fully loaded
+        document.addEventListener('DOMContentLoaded', function() {
+            // Add event listeners to all textareas
+            setTimeout(() => {
+                const textAreas = document.querySelectorAll('textarea');
+                textAreas.forEach(textArea => {
+                    textArea.addEventListener('keydown', handleChatKeyPress);
+                });
+            }, 1000); // Small delay to ensure elements are loaded
+        });
+        </script>
+    """, unsafe_allow_html=True)
+    
+    with st.container():
+        # Text area with a unique key
+        st.text_area(
+            "Your question:", 
+            value="",
+            key=f"chat_input_{st.session_state.chat_input_key}",
+            height=100,
+            placeholder="Type your question..."
+        )
+        
+        col1, col2 = st.columns([1, 5])
+        with col1:
+            if st.button("Send", key=f"send_button_{st.session_state.chat_input_key}", on_click=handle_message_submission):
+                pass  # The actual processing happens in the callback
+
+def display_chat_history(messages_container):
+    """Display chat history."""
+    if not st.session_state.repo_chat or not hasattr(st.session_state.repo_chat, 'history'):
+        return
+        
+    # Display chat history
+    messages = st.session_state.repo_chat.history.get_messages()
+    for message in messages:
+        if message["role"] == "user":
+            with messages_container:
+                st.markdown(f"**You:** {message['content']}")
+        elif message["role"] == "assistant":
+            with messages_container:
+                st.markdown(f"**LORE:** {message['content']}")
 
 def main():
     """Main Streamlit application."""
@@ -384,6 +604,26 @@ def main():
             if st.session_state.repo_source == "local":
                 st.session_state.repo_owner = st.text_input("Repository Owner")
                 st.session_state.repo_name = st.text_input("Repository Name")
+        
+        # Additional resources
+        st.subheader("Additional Resources")
+        st.session_state.documentation = st.text_area("Documentation", value=st.session_state.documentation)
+        st.session_state.product_requirements = st.text_area("Product Requirements", value=st.session_state.product_requirements)
+        st.session_state.meeting_notes = st.text_area("Meeting Notes", value=st.session_state.meeting_notes)
+        st.session_state.additional_context = st.text_area("Additional Context", value=st.session_state.additional_context)
+        st.session_state.use_additional_resources = st.checkbox("Use Additional Resources", value=st.session_state.use_additional_resources)
+        
+        # URL resources
+        st.session_state.documentation_url = st.text_input("Documentation URL", value=st.session_state.documentation_url)
+        st.session_state.product_requirements_url = st.text_input("Product Requirements URL", value=st.session_state.product_requirements_url)
+        st.session_state.meeting_notes_url = st.text_input("Meeting Notes URL", value=st.session_state.meeting_notes_url)
+        st.session_state.use_url_resources = st.checkbox("Use URL Resources", value=st.session_state.use_url_resources)
+        
+        # Design diagram
+        st.subheader("Design Diagram")
+        st.session_state.design_diagram = st.file_uploader("Design Diagram", type=["png", "jpg", "jpeg"])
+        st.session_state.use_design_diagram = st.checkbox("Use Design Diagram", value=st.session_state.use_design_diagram)
+        st.session_state.design_diagram_description = st.text_area("Design Diagram Description", value=st.session_state.design_diagram_description)
         
         # Analyze button
         if st.button("Analyze Repository"):
@@ -493,7 +733,7 @@ def main():
             st.markdown(
                 "Ask questions about the repository and get answers based on the analysis."
             )
-            handle_chat()
+            chat_container()
         
         with tab4:
             # Display raw data

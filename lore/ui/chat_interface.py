@@ -7,6 +7,7 @@ import logging
 import json
 from typing import List, Dict, Any, Optional
 import copy
+from pathlib import Path
 
 from ..llm.llama_client import LlamaClient
 from ..analysis.analyzer import RepositoryAnalyzer
@@ -82,6 +83,9 @@ class RepoChat:
         self.repository_context = repository_context
         self.history = history or ChatHistory()
         self.first_message = True
+        self.has_design_diagram = False
+        # Store multiple diagrams
+        self.design_diagrams = []
         
         # Initialize with system prompt
         self.system_prompt = (
@@ -101,28 +105,37 @@ class RepoChat:
             "\n"
             "For ALL responses:\n"
             "1. ALWAYS cite your sources of information at the end of your response\n"
-            "2. Clearly indicate which parts of your response came from:\n"
-            "   - Code in specific files\n"
-            "   - Commit history\n"
-            "   - Issues or PRs\n"
-            "   - Documentation\n"
-            "   - Product requirements\n"
-            "   - Meeting notes\n"
-            "   - Additional context\n"
-            "   - Design diagrams\n"
-            "3. Use the format: 'Sources: [type of source] - [specific file/commit/issue]'\n"
-            "4. If information is derived from multiple sources, list ALL of them\n"
-            "\nProvide clear, concise, and accurate answers. If you don't know something, say so directly."
+            "2. ONLY mention sources that were actually provided to you:\n"
+            "   - Repository context (only if used)\n"
+            "   - Design diagrams or images (only if provided AND used)\n"
+            "   - Specific files, file paths, or code snippets referenced (list them precisely)\n"
+            "3. DO NOT mention hypothetical sources - if you don't have access to something, don't list it as a source\n"
+            "4. DO NOT use phrases like 'not provided' or 'not available' in source citations\n"
+            "5. Format your responses clearly with Markdown for headings, code blocks, and lists\n"
+            "6. Provide clear, concise answers focused on high-level insights\n"
+            "7. Only show code when specifically asked to do so\n"
         )
         
-        # Add design diagram handling to the system prompt
-        self.design_diagram_exists = False
+        # Add repository context to the history
+        if repository_context:
+            self.history.add_message("system", self.system_prompt)
+            self.history.add_message("system", repository_context)
     
     def set_design_diagram(self, exists: bool = False):
-        """Set whether a design diagram is available."""
-        self.design_diagram_exists = exists
+        """Set whether design diagrams are available."""
+        self.has_design_diagram = exists
     
-    def chat(self, user_message: str, design_diagram_path: Optional[str] = None, stream: bool = False) -> str:
+    def add_design_diagram(self, diagram_path: str):
+        """Add a design diagram to the chat context.
+        
+        Args:
+            diagram_path: Path to the design diagram
+        """
+        if diagram_path and Path(diagram_path).exists():
+            self.design_diagrams.append(diagram_path)
+            self.has_design_diagram = True
+    
+    def chat(self, user_message: str, design_diagram_path: Optional[str] = None, stream: bool = False):
         """
         Send a message to the chat interface and get a response.
         
@@ -138,107 +151,76 @@ class RepoChat:
             # Add user message to history
             self.history.add_message("user", user_message)
             
-            # Create messages list with system prompt
-            messages = [
-                {"role": "system", "content": self.system_prompt}
-            ]
+            # Prepare messages for the API
+            messages = self.history.get_messages()
             
-            # Llama API has strict requirements:
-            # 1. All messages must have role and content
-            # 2. 'content' must be a string for system, user, and assistant messages
-            # 3. Only 'user' messages can have array content for multimodal
-            
-            # Add repository context with better structure - as a system message
-            if self.repository_context:
-                context_content = (
-                    "# REPOSITORY ANALYSIS CONTEXT\n\n"
-                    "Here is the detailed repository context including all commits, "
-                    "file changes, and documentation. Pay special attention to the "
-                    "RECENT SIGNIFICANT COMMITS section which shows all file changes:\n\n"
-                    f"{self.repository_context}"
-                )
-                messages.append({
-                    "role": "system",
-                    "content": context_content
-                })
-            
-            # Image message handling
-            if design_diagram_path and self.design_diagram_exists:
-                # First add a regular text message about the diagram
-                messages.append({
-                    "role": "user", 
-                    "content": "I'd like you to analyze this design diagram for the codebase."
-                })
+            # Add design diagram if available and this is the first message or explicitly requested
+            if (design_diagram_path or self.design_diagrams) and self.has_design_diagram and ("diagram" in user_message.lower() or "image" in user_message.lower() or self.first_message):
+                # If a new diagram path is provided, add it to our collection
+                if design_diagram_path and design_diagram_path not in self.design_diagrams:
+                    self.design_diagrams.append(design_diagram_path)
                 
-                # Add image as a separate message with proper multimodal format
+                # Use the first diagram by default or a specific one if path is provided
+                current_diagram = design_diagram_path if design_diagram_path else self.design_diagrams[0]
+                
                 try:
-                    resized_path = resize_image_if_needed(design_diagram_path)
-                    if resized_path:
-                        base64_image = encode_image_to_base64(resized_path)
-                        if base64_image:
-                            # Create a properly structured multimodal message
-                            image_msg = {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/jpeg;base64,{base64_image}"
-                                        }
-                                    }
-                                ]
-                            }
-                            messages.append(image_msg)
+                    # Process and encode the diagram
+                    if current_diagram and Path(current_diagram).exists():
+                        # Resize image if needed and encode to base64
+                        encoded_image = encode_image_to_base64(current_diagram)
+                        
+                        # Create an image message in the Llama format
+                        image_url = {
+                            "url": f"data:image/jpeg;base64,{encoded_image}",
+                            "detail": "high"
+                        }
+                        
+                        # Insert image message before user's latest message
+                        image_message = {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": image_url
+                                }
+                            ]
+                        }
+                        
+                        # Find the index of the last user message
+                        last_user_idx = None
+                        for i, msg in enumerate(messages):
+                            if msg["role"] == "user":
+                                last_user_idx = i
+                        
+                        if last_user_idx is not None:
+                            # Insert the image message before the last user message
+                            messages.insert(last_user_idx, image_message)
+                            
+                            # If this is the first message, also add a reminder
+                            if self.first_message:
+                                instruction_msg = {
+                                    "role": "user",
+                                    "content": "This is a design diagram for the repository. Please refer to it when answering questions about the architecture."
+                                }
+                                messages.insert(last_user_idx + 1, instruction_msg)
                 except Exception as e:
-                    logger.error(f"Error processing image: {e}")
-            
-            # Add chat history - only include simple text messages
-            history_messages = []
-            for msg in self.history.get_messages():
-                # Skip the current message as we'll add it separately
-                if msg["role"] == "user" and msg["content"] == user_message:
-                    continue
-                    
-                # Ensure content is a string (Llama API requirement)
-                if not isinstance(msg["content"], str):
-                    logger.warning(f"Skipping non-string message in history: {type(msg['content'])}")
-                    continue
-                    
-                # Add message with validly formatted content
-                history_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]  # This is guaranteed to be a string now
-                })
-            
-            # Limit history messages to avoid context limits
-            if len(history_messages) > 0:
-                messages.extend(history_messages[-10:])  # Only include last 10 messages
-                
-            # Add current user message (always a string)
-            messages.append({"role": "user", "content": user_message})
-            
-            # Log the final message structure for debugging
-            logger.debug("Final messages structure for Llama API:")
-            for i, msg in enumerate(messages):
-                logger.debug(f"Message {i}:")
-                logger.debug(f"  Role: {msg.get('role')}")
-                if isinstance(msg.get('content'), list):
-                    logger.debug("  Content: [multimodal content]")
-                else:
-                    content_preview = str(msg.get('content', ''))[:100] + "..." if len(str(msg.get('content', ''))) > 100 else str(msg.get('content', ''))
-                    logger.debug(f"  Content: {content_preview}")
+                    logger.error(f"Error processing design diagram: {e}")
+                    # If there's an error, continue without the image
+                    pass
             
             # Get response from LLM
+            assistant_message = ""
+            
             if stream:
-                # We don't want to return a generator - collect all chunks
-                assistant_message = ""
-                for chunk in self.llm_client.chat_stream(messages):
+                # Streaming response
+                for chunk in self.llm_client.stream_analysis(None, messages=messages):
                     if isinstance(chunk, str):
                         assistant_message += chunk
-                    elif isinstance(chunk, dict) and "content" in chunk:
-                        assistant_message += chunk["content"]
-                    elif isinstance(chunk, dict) and "text" in chunk:
-                        assistant_message += chunk["text"]
+                    elif isinstance(chunk, dict):
+                        if "content" in chunk:
+                            assistant_message += chunk["content"]
+                        elif "text" in chunk:
+                            assistant_message += chunk["text"]
             else:
                 # Normal (non-streaming) response
                 response = self.llm_client.chat(messages)
@@ -295,6 +277,10 @@ class RepoChat:
             # Add assistant message to history
             self.history.add_message("assistant", assistant_message)
             
+            # Set first_message to False after the first interaction
+            if self.first_message:
+                self.first_message = False
+                
             return assistant_message
         
         except Exception as e:

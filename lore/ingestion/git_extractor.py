@@ -100,9 +100,7 @@ class GitExtractor:
         commits = []
         commit_iter = list(self.repo.iter_commits())
         
-        if self.max_history:
-            commit_iter = commit_iter[:self.max_history]
-            
+        # Remove max_history limit to get all commits
         for commit in tqdm(commit_iter, desc="Processing commits"):
             try:
                 # Get commit data
@@ -112,35 +110,52 @@ class GitExtractor:
                     'authored_date': datetime.fromtimestamp(commit.authored_date),
                     'committer': f"{commit.committer.name} <{commit.committer.email}>",
                     'committed_date': datetime.fromtimestamp(commit.committed_date),
-                    'message': commit.message,
-                    'summary': commit.summary,
+                    'message': commit.message.strip(),
                     'files_changed': [],
                     'insertions': 0,
-                    'deletions': 0,
+                    'deletions': 0
                 }
                 
-                # Get diff stats for files changed
-                if commit.parents:
-                    diff_index = commit.parents[0].diff(commit)
-                    for diff in diff_index:
+                # Get parent commit for diff
+                parent = commit.parents[0] if commit.parents else None
+                
+                # Process file changes
+                if parent:
+                    diffs = parent.diff(commit)
+                    for diff in diffs:
                         try:
-                            file_path = diff.b_path if diff.b_path else diff.a_path
-                            stats = diff.stats
+                            file_path = diff.b_path or diff.a_path
+                            insertions = 0
+                            deletions = 0
+                            
+                            # Get the actual diff content
+                            if diff.b_blob and diff.a_blob:  # Modified file
+                                a_lines = diff.a_blob.data_stream.read().decode('utf-8', errors='replace').count('\n')
+                                b_lines = diff.b_blob.data_stream.read().decode('utf-8', errors='replace').count('\n')
+                                insertions = max(0, b_lines - a_lines)
+                                deletions = max(0, a_lines - b_lines)
+                            elif diff.b_blob:  # New file
+                                insertions = diff.b_blob.data_stream.read().decode('utf-8', errors='replace').count('\n')
+                            elif diff.a_blob:  # Deleted file
+                                deletions = diff.a_blob.data_stream.read().decode('utf-8', errors='replace').count('\n')
+                            
                             commit_data['files_changed'].append({
                                 'path': file_path,
-                                'insertions': stats.get('insertions', 0),
-                                'deletions': stats.get('deletions', 0),
-                                'lines': stats.get('lines', 0),
+                                'insertions': insertions,
+                                'deletions': deletions,
+                                'lines': insertions + deletions,
                                 'type': self._get_change_type(diff),
                             })
-                            commit_data['insertions'] += stats.get('insertions', 0)
-                            commit_data['deletions'] += stats.get('deletions', 0)
+                            commit_data['insertions'] += insertions
+                            commit_data['deletions'] += deletions
                         except Exception as e:
                             logger.warning(f"Error processing diff in commit {commit.hexsha}: {e}")
+                            continue
                 
                 commits.append(commit_data)
             except Exception as e:
                 logger.warning(f"Error processing commit {commit.hexsha}: {e}")
+                continue
                 
         return commits
     

@@ -14,6 +14,12 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+class LlamaAPIError(Exception):
+    """Exception raised for Llama API errors."""
+    def __init__(self, message: str, response: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.response = response
+
 class LlamaClient:
     """Client for interacting with the Llama 4 API."""
     
@@ -35,183 +41,266 @@ class LlamaClient:
         if not self.api_key:
             raise ValueError("Llama API key not provided")
     
-    def _make_request(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _make_request(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Make a request to the Llama API.
         
         Args:
             endpoint: API endpoint
-            data: Request payload
+            payload: Request payload
             
         Returns:
-            API response as dictionary
+            API response
         """
-        url = f"{self.api_base}/{endpoint.lstrip('/')}"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        
-        logger.debug("=== API Request Details ===")
-        logger.debug(f"URL: {url}")
-        logger.debug(f"Headers: {headers}")
-        logger.debug(f"Payload: {json.dumps(data, indent=2)}")
-        
         try:
-            logger.debug("Sending POST request to API...")
-            response = requests.post(url, headers=headers, json=data)
+            url = f"{self.api_base}/{endpoint}"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
             
-            logger.debug("=== API Response Details ===")
-            logger.debug(f"Status Code: {response.status_code}")
-            logger.debug(f"Response Headers: {dict(response.headers)}")
+            logger.debug(f"Making request to {url}")
+            response = requests.post(url, headers=headers, json=payload)
+            response_body = response.json()
+            logger.debug(f"Response Body: {json.dumps(response_body, indent=2)}")
             
-            try:
-                response_json = response.json()
-                logger.debug(f"Response Body: {json.dumps(response_json, indent=2)}")
+            if response.status_code != 200:
+                error_msg = response_body.get('detail', 'Unknown error')
+                logger.error(f"API request failed with status {response.status_code}: {error_msg}")
+                raise LlamaAPIError(f"API request failed: {error_msg}", response_body)
+            
+            # Extract the actual response content
+            content = None
+            if 'choices' in response_body and response_body['choices']:
+                choice = response_body['choices'][0]
+                if isinstance(choice, dict):
+                    if 'message' in choice and isinstance(choice['message'], dict):
+                        content = choice['message'].get('content')
+                    elif 'text' in choice:
+                        content = choice['text']
+            elif 'completion_message' in response_body:
+                msg = response_body['completion_message']
+                if isinstance(msg, dict):
+                    if 'content' in msg:
+                        content = msg['content']
+                    elif 'text' in msg:
+                        content = msg['text']
+                else:
+                    content = str(msg)
+                    
+            if content is None:
+                logger.error(f"Could not extract content from response: {json.dumps(response_body, indent=2)}")
+                raise LlamaAPIError("No content found in API response", response_body)
                 
-                # Transform response to OpenAI format if needed
-                if 'choices' in response_json and len(response_json['choices']) > 0:
-                    choice = response_json['choices'][0]
-                    if 'text' in choice and 'message' not in choice:
-                        # Clean up response text
-                        sanitized_text = self._sanitize_response(choice['text'])
-                        # Convert to OpenAI format
-                        choice['message'] = {'content': sanitized_text}
-                        del choice['text']
-                    elif 'content' in choice and 'message' not in choice:
-                        # Clean up response text
-                        sanitized_text = self._sanitize_response(choice['content'])
-                        # Convert to OpenAI format
-                        choice['message'] = {'content': sanitized_text}
-                        del choice['content']
-                    elif 'message' in choice and 'content' in choice['message']:
-                        # Clean up response text in OpenAI format
-                        choice['message']['content'] = self._sanitize_response(choice['message']['content'])
-                
-                return response_json
-                
-            except json.JSONDecodeError:
-                logger.error("Failed to parse response as JSON")
-                logger.debug(f"Raw Response Text: {response.text}")
-                raise
+            # Clean up the content
+            cleaned_content = self._sanitize_response(content)
             
-            response.raise_for_status()
-            return response_json
-            
+            # Return in a consistent format
+            return {
+                'completion_message': {
+                    'content': cleaned_content,
+                    'role': 'assistant',
+                    'type': 'text'
+                },
+                'metrics': response_body.get('usage', {})
+            }
+                
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {str(e)}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"Error response body: {e.response.text}")
+            logger.error(f"Request error: {str(e)}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in _make_request: {str(e)}")
             raise
     
     def _sanitize_response(self, text: str) -> str:
         """
-        Sanitize the response text to remove repetitive patterns and truncate if too long.
+        Clean up the response text to remove repetitive or nonsensical content.
+        
+        Args:
+            text: Raw response text
+            
+        Returns:
+            Cleaned response text
         """
+        # Handle non-string input
+        if not isinstance(text, str):
+            if isinstance(text, dict):
+                if 'text' in text:
+                    text = text['text']
+                elif 'content' in text:
+                    text = text['content']
+                else:
+                    logger.warning(f"Unexpected dict format in _sanitize_response: {text}")
+                    return str(text)
+            else:
+                logger.warning(f"Unexpected response type in _sanitize_response: {type(text)}")
+                return str(text)
+                
         if not text:
             return text
             
-        # Detect repetitive patterns (3 or more repetitions)
-        pattern_length = 10  # Look for patterns of this length or longer
-        for i in range(pattern_length, len(text) // 2):
-            pattern = text[0:i]
-            if text.count(pattern) >= 3:
-                # Found a repetitive pattern, truncate at first occurrence
-                end_idx = text.find(pattern) + len(pattern)
-                return text[:end_idx]
-                
-        # Check for repetitive code blocks
-        if text.count('```python') > 2:
-            # Too many code blocks, truncate after second one
-            parts = text.split('```python')
-            return '```python'.join(parts[:3])
-            
-        return text
+        # Split into sections by headers
+        sections = []
+        current_section = []
         
+        for line in text.split('\n'):
+            if line.startswith('#'):
+                if current_section:
+                    sections.append('\n'.join(current_section))
+                current_section = [line]
+            else:
+                current_section.append(line)
+                
+        if current_section:
+            sections.append('\n'.join(current_section))
+            
+        # Process each section
+        cleaned_sections = []
+        for section in sections:
+            # Skip sections that are mostly repetitive
+            lines = section.split('\n')
+            unique_lines = set(lines)
+            if len(unique_lines) < len(lines) * 0.3:  # More than 70% repetition
+                continue
+                
+            # Remove consecutive duplicate lines
+            cleaned_lines = []
+            prev_line = None
+            for line in lines:
+                if line != prev_line and line.strip():
+                    cleaned_lines.append(line)
+                prev_line = line
+                    
+            # Skip sections with nonsensical content
+            section_text = '\n'.join(cleaned_lines)
+            if any(word in section_text.lower() for word in ['sălbă', 'săptă', 'spre', 'mistress']):
+                continue
+                
+            cleaned_sections.append(section_text)
+            
+        return '\n\n'.join(cleaned_sections)
+    
     SYSTEM_PROMPTS = {
         "analyze_architecture": (
-            "You are an expert software architect analyzing a codebase. "
-            "Provide a comprehensive analysis of the repository architecture, design patterns, "
-            "and code organization. Identify strengths, weaknesses, architectural drift, and anti-patterns. "
-            "Focus on high-level insights and avoid generating code snippets unless specifically asked. "
-            "Keep responses concise and to the point."
+            "Analyze this codebase's architecture and design. Focus on: "
+            "1. Main components and their interactions "
+            "2. Key design patterns and architectural choices "
+            "3. Code organization and modularity "
+            "4. Notable strengths or areas for improvement "
+            "Be concise and specific. Avoid code generation."
         ),
-        "analyze_history": (
-            "You are an expert in software development history analysis. "
-            "Analyze the Git history to understand the evolution of the codebase, key milestones, "
-            "and development patterns. Focus on meaningful insights about code changes and development "
-            "trends. Avoid generating code snippets. Keep responses concise and to the point."
+        "analyze_complexity": (
+            "Evaluate code complexity and maintainability. Identify: "
+            "1. Complex components needing attention "
+            "2. Potential technical debt "
+            "3. Specific improvement recommendations "
+            "Be brief and actionable."
+        ),
+        "historical_analysis": (
+            "Analyze repository history. Focus on: "
+            "1. Major changes and evolution "
+            "2. Development patterns "
+            "3. Key milestones "
+            "Keep it short and focused."
         ),
         "chat": (
-            "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant "
-            "that helps developers understand codebases. You have been provided with the repository context. "
-            "Provide clear, concise, and accurate answers. Keep responses focused and relevant to the "
-            "questions asked. If you don't know something, say so directly. Do not generate code unless "
-            "specifically asked. End your response when you've fully answered the question."
+            "You are a helpful coding assistant analyzing this repository. "
+            "Provide clear, concise answers. Focus on high-level insights. "
+            "Only show code if specifically asked."
         )
     }
     
     def analyze_repository(
         self,
         content: str,
-        model: str = "llama-2-70b-chat",  # Updated to standard model name
-        temperature: float = 0.7,
-        max_tokens: int = 2000,
+        model: str = "Llama-4-Maverick-17B-128E-Instruct-FP8",
+        temperature: float = 0.2,
+        max_tokens: int = 10000,
         task: str = "analyze_architecture",
         messages: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
         """
-        Analyze a repository using the Llama API.
+        Analyze repository content using the Llama API.
         
         Args:
-            content: Content to analyze
-            model: Model to use
-            temperature: Temperature for generation
-            max_tokens: Maximum tokens to generate
-            task: Task type (analyze_architecture, historical_analysis, etc.)
-            messages: Optional list of chat messages
+            content: Repository content to analyze
+            model: Model to use for analysis
+            temperature: Temperature for response generation
+            max_tokens: Maximum tokens in response
+            task: Analysis task to perform
+            messages: Optional chat messages for chat task
             
         Returns:
-            API response
+            API response as a dictionary
         """
+        logger.debug(f"Using {model} for analysis")
+        
+        # Prepare request payload
+        payload = {
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        if messages:
+            # Chat format
+            payload["messages"] = messages
+        else:
+            # Standard format
+            logger.debug("Using standard format for analysis")
+            payload["messages"] = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful coding assistant analyzing this repository. "
+                              "Provide clear, concise answers. Focus on high-level insights. "
+                              "Only show code if specifically asked."
+                },
+                {
+                    "role": "user",
+                    "content": f"Task: {task}\n\nRepository content:\n{content}"
+                }
+            ]
+        
+        logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
+        
         try:
-            if messages is not None:
-                logger.debug("Using provided messages for chat mode")
-                # Validate message format
-                for msg in messages:
-                    if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
-                        raise ValueError("Each message must be a dict with 'role' and 'content' keys")
-                    if msg['role'] not in ['system', 'user', 'assistant']:
-                        raise ValueError("Message role must be one of: system, user, assistant")
-                
-                # Use provided messages for chat mode
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stop": ["<|end|>"]  # Add stop sequence
-                }
-            else:
-                logger.debug("Using standard format for analysis")
-                # Use standard format for analysis
-                payload = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPTS.get(task, self.SYSTEM_PROMPTS["analyze_architecture"])},
-                        {"role": "user", "content": content}
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stop": ["<|end|>"]  # Add stop sequence
-                }
+            response = requests.post(
+                f"{self.api_base}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=60
+            )
+            response.raise_for_status()
+            result = response.json()
             
-            logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
-            return self._make_request("chat/completions", payload)
+            # Add model and metrics to response
+            result["model"] = model
+            result["metrics"] = {
+                "tokens": result.get("usage", {}).get("total_tokens", 0),
+                "prompt_tokens": result.get("usage", {}).get("prompt_tokens", 0),
+                "completion_tokens": result.get("usage", {}).get("completion_tokens", 0)
+            }
             
-        except Exception as e:
-            logger.error(f"Error in analyze_repository: {str(e)}")
-            raise
+            # Add response format metadata without sending it to the API
+            result["response_format"] = {
+                "type": "markdown",
+                "version": "1.0"
+            }
+            
+            return result
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            if hasattr(e, 'response') and hasattr(e.response, 'json'):
+                error_details = e.response.json()
+                logger.error(f"API error details: {error_details}")
+            raise LlamaAPIError(f"API request failed: {str(e)}")
     
     def stream_analysis(self, 
                        content: str, 
@@ -237,24 +326,31 @@ class LlamaClient:
         # Define system prompts based on task (same as above)
         system_prompts = {
             "analyze_architecture": (
-                "You are an expert software architect analyzing a codebase. "
-                "Provide a comprehensive analysis of the repository architecture, design patterns, "
-                "and code organization. Identify strengths, weaknesses, architectural drift, and anti-patterns. "
-                "Focus on high-level insights and avoid generating code snippets unless specifically asked. "
-                "Keep responses concise and to the point."
+                "Analyze this codebase's architecture and design. Focus on: "
+                "1. Main components and their interactions "
+                "2. Key design patterns and architectural choices "
+                "3. Code organization and modularity "
+                "4. Notable strengths or areas for improvement "
+                "Be concise and specific. Avoid code generation."
             ),
-            "analyze_history": (
-                "You are an expert in software development history analysis. "
-                "Analyze the Git history to understand the evolution of the codebase, key milestones, "
-                "and development patterns. Focus on meaningful insights about code changes and development "
-                "trends. Avoid generating code snippets. Keep responses concise and to the point."
+            "analyze_complexity": (
+                "Evaluate code complexity and maintainability. Identify: "
+                "1. Complex components needing attention "
+                "2. Potential technical debt "
+                "3. Specific improvement recommendations "
+                "Be brief and actionable."
+            ),
+            "historical_analysis": (
+                "Analyze repository history. Focus on: "
+                "1. Major changes and evolution "
+                "2. Development patterns "
+                "3. Key milestones "
+                "Keep it short and focused."
             ),
             "chat": (
-                "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant "
-                "that helps developers understand codebases. You have been provided with the repository context. "
-                "Provide clear, concise, and accurate answers. Keep responses focused and relevant to the "
-                "questions asked. If you don't know something, say so directly. Do not generate code unless "
-                "specifically asked. End your response when you've fully answered the question."
+                "You are a helpful coding assistant analyzing this repository. "
+                "Provide clear, concise answers. Focus on high-level insights. "
+                "Only show code if specifically asked."
             )
         }
         
@@ -330,7 +426,7 @@ class LlamaClient:
     
     def chunk_and_analyze(self, 
                          content: str,
-                         model: str = "llama-2-70b-chat",  # Updated to standard model name
+                         model: str = "llama-2-70b-chat",  
                          chunk_size: int = 100000,
                          overlap: int = 5000,
                          task: str = "analyze_architecture") -> List[Dict[str, Any]]:

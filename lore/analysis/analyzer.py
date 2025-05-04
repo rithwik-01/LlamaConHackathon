@@ -34,12 +34,12 @@ class RepositoryAnalyzer:
             self.output_dir.mkdir(parents=True)
     
     def prepare_repository_context(self, 
-                                  git_extractor: GitExtractor, 
-                                  issue_extractor: Optional[IssueExtractor] = None,
-                                  repo_owner: Optional[str] = None,
-                                  repo_name: Optional[str] = None,
-                                  include_issues: bool = False,
-                                  include_prs: bool = False) -> str:
+                              git_extractor: GitExtractor, 
+                              issue_extractor: Optional[IssueExtractor] = None,
+                              repo_owner: Optional[str] = None,
+                              repo_name: Optional[str] = None,
+                              include_issues: bool = False,
+                              include_prs: bool = False) -> str:
         """
         Prepare the repository context for analysis.
         
@@ -60,78 +60,131 @@ class RepositoryAnalyzer:
         context_parts.append("# REPOSITORY ANALYSIS CONTEXT\n\n")
         context_parts.append(f"Repository path: {git_extractor.repo_path}\n\n")
         
-        # Get file contents
-        file_contents = git_extractor.get_file_contents()
-        context_parts.append(f"## FILE CONTENTS ({len(file_contents)} files)\n\n")
-        
-        for file_path, content in file_contents.items():
-            # Skip binary files or very large files
-            if len(content) > 100000:  # Skip files larger than 100KB
-                context_parts.append(f"### {file_path}\n\n(File too large, skipped)\n\n")
-                continue
-                
-            context_parts.append(f"### {file_path}\n\n```\n{content}\n```\n\n")
-        
-        # Get commit history
+        # Get commit history - get all commits
         commits = git_extractor.get_commit_history()
-        context_parts.append(f"## COMMIT HISTORY ({len(commits)} commits)\n\n")
+        significant_commits = [
+            commit for commit in commits  # Remove limit, use all commits
+            if len(commit['files_changed']) > 0 and  # Has actual changes
+            not any(word in commit['message'].lower() for word in ['merge', 'typo', 'fix typo', 'formatting'])
+        ]
         
-        for commit in commits[:100]:  # Limit to 100 commits to avoid context overflow
+        # Track which files were changed in commits
+        changed_files = {}
+        for commit in significant_commits:
+            for file_change in commit['files_changed']:
+                file_path = file_change['path']
+                if file_path not in changed_files:
+                    changed_files[file_path] = []
+                changed_files[file_path].append({
+                    'hash': commit['hash'][:8],
+                    'message': commit['message'],
+                    'date': commit['authored_date'],
+                    'insertions': file_change['insertions'],
+                    'deletions': file_change['deletions']
+                })
+        
+        # Get file contents - ONLY include key files
+        file_contents = git_extractor.get_file_contents()
+        important_files = {
+            path: content for path, content in file_contents.items() 
+            if any(path.endswith(ext) for ext in ['.py', '.java', '.kt', '.js', '.ts', '.go', '.rs', '.cpp', '.h'])
+            and not any(part in path.lower() for part in ['test', 'mock', 'stub', 'fixture'])
+            and len(content) < 50000  # Limit individual file size
+        }
+        
+        # Sort files by number of changes and size
+        sorted_files = sorted(
+            important_files.items(),
+            key=lambda x: (len(changed_files.get(x[0], [])), len(x[1])),
+            reverse=True
+        )
+        
+        context_parts.append(f"## KEY SOURCE FILES ({len(important_files)} files)\n\n")
+        for file_path, content in sorted_files[:10]:  # Only include top 10 files
+            file_changes = changed_files.get(file_path, [])
+            context_parts.append(f"### {file_path}\n")
+            if file_changes:
+                context_parts.append("\nRecent changes:\n")
+                for change in file_changes[:3]:  # Show last 3 changes
+                    context_parts.append(
+                        f"- [{change['hash']}] {change['message']} "
+                        f"(+{change['insertions']}, -{change['deletions']})\n"
+                    )
+            context_parts.append(f"\n```\n{content}\n```\n\n")
+        
+        context_parts.append(f"## RECENT SIGNIFICANT COMMITS ({len(significant_commits)} commits)\n\n")
+        for commit in significant_commits[:10]:  # Only include top 10 significant commits
             context_parts.append(
                 f"### Commit {commit['hash'][:8]}\n\n"
-                f"Author: {commit['author']}\n"
                 f"Date: {commit['authored_date']}\n"
                 f"Message: {commit['message']}\n"
-                f"Files changed: {len(commit['files_changed'])}\n"
-                f"Insertions: {commit['insertions']}, Deletions: {commit['deletions']}\n\n"
+                f"Files changed:\n"
             )
-        
-        # Get documentation
-        documentation = git_extractor.get_documentation()
-        if documentation:
-            context_parts.append(f"## DOCUMENTATION ({len(documentation)} files)\n\n")
             
-            for doc_path, content in documentation.items():
+            # Group files by type/directory for better organization
+            grouped_files = {}
+            for file_change in commit['files_changed']:
+                file_path = file_change['path']
+                dir_path = str(Path(file_path).parent)
+                if dir_path not in grouped_files:
+                    grouped_files[dir_path] = []
+                grouped_files[dir_path].append({
+                    'path': file_path,
+                    'insertions': file_change['insertions'],
+                    'deletions': file_change['deletions']
+                })
+            
+            # Output files by group
+            for dir_path, files in sorted(grouped_files.items()):
+                if dir_path == '.':
+                    context_parts.append("\nRoot directory:\n")
+                else:
+                    context_parts.append(f"\nDirectory {dir_path}:\n")
+                
+                for file_info in files:
+                    context_parts.append(
+                        f"- {file_info['path']} "
+                        f"(+{file_info['insertions']}, -{file_info['deletions']} lines)\n"
+                    )
+            
+            context_parts.append(f"\nTotal: +{commit['insertions']}, -{commit['deletions']} lines\n\n")
+        
+        # Get documentation - only README and key docs
+        documentation = git_extractor.get_documentation()
+        key_docs = {
+            path: content for path, content in documentation.items()
+            if path.lower() in ['readme.md', 'contributing.md', 'architecture.md', 'design.md']
+            or 'architecture' in path.lower()
+            or 'design' in path.lower()
+        }
+        
+        if key_docs:
+            context_parts.append(f"## KEY DOCUMENTATION ({len(key_docs)} files)\n\n")
+            for doc_path, content in key_docs.items():
+                # Truncate very long docs
+                if len(content) > 10000:
+                    content = content[:10000] + "\n... (truncated)\n"
                 context_parts.append(f"### {doc_path}\n\n{content}\n\n")
         
-        # Get issues and PRs if requested
+        # Get issues and PRs if requested - only recent important ones
         if include_issues and issue_extractor and repo_owner and repo_name:
             try:
-                issues = issue_extractor.get_issues(repo_owner, repo_name, max_issues=50)
-                context_parts.append(f"## ISSUES ({len(issues)} issues)\n\n")
-                
-                for issue in issues:
-                    title = issue.get('title', 'No title')
-                    number = issue.get('number', 0)
-                    state = issue.get('state', 'unknown')
-                    body = issue.get('body', 'No description')
-                    
-                    context_parts.append(
-                        f"### Issue #{number}: {title} ({state})\n\n"
-                        f"{body}\n\n"
-                    )
+                issues = issue_extractor.get_issues(repo_owner, repo_name, max_issues=10)
+                if issues:
+                    context_parts.append(f"## RECENT ISSUES ({len(issues)} issues)\n\n")
+                    for issue in issues:
+                        # Only include title and first paragraph of description
+                        description = issue['body'].split('\n\n')[0] if issue['body'] else ''
+                        context_parts.append(
+                            f"### {issue['title']}\n\n"
+                            f"State: {issue['state']}\n"
+                            f"Created: {issue['created_at']}\n"
+                            f"{description}\n\n"
+                        )
             except Exception as e:
-                logger.error(f"Error retrieving issues: {e}")
+                logger.warning(f"Error fetching issues: {e}")
         
-        if include_prs and issue_extractor and repo_owner and repo_name:
-            try:
-                prs = issue_extractor.get_pull_requests(repo_owner, repo_name, max_prs=50)
-                context_parts.append(f"## PULL REQUESTS ({len(prs)} PRs)\n\n")
-                
-                for pr in prs:
-                    title = pr.get('title', 'No title')
-                    number = pr.get('number', 0)
-                    state = pr.get('state', 'unknown')
-                    body = pr.get('body', 'No description')
-                    
-                    context_parts.append(
-                        f"### PR #{number}: {title} ({state})\n\n"
-                        f"{body}\n\n"
-                    )
-            except Exception as e:
-                logger.error(f"Error retrieving pull requests: {e}")
-        
-        return "".join(context_parts)
+        return "\n".join(context_parts)
     
     def analyze_repository(self,
                           context: str,
@@ -157,7 +210,7 @@ class RepositoryAnalyzer:
                 model=model,
                 task=task,
                 temperature=0.2,  # Lower temperature for more focused responses
-                max_tokens=1000   # Limit response length
+                max_tokens=10000   # Limit response length
             )
             
             # Save result if output_dir is specified
@@ -223,13 +276,51 @@ class RepositoryAnalyzer:
             Formatted report
         """
         # Extract content from the analysis
-        if 'choices' in analysis and len(analysis['choices']) > 0:
-            content = analysis['choices'][0]['message']['content']
-        elif 'content' in analysis:
-            content = analysis['content']
-        else:
-            content = "No analysis content found."
+        content = None
         
+        logger.debug(f"Analysis type: {type(analysis)}")
+        logger.debug(f"Analysis keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'Not a dict'}")
+        
+        if isinstance(analysis, dict):
+            if 'completion_message' in analysis:
+                if isinstance(analysis['completion_message'], dict):
+                    content = analysis['completion_message'].get('content', '')
+                else:
+                    content = str(analysis['completion_message'])
+            elif 'choices' in analysis and analysis['choices']:
+                choice = analysis['choices'][0]
+                if isinstance(choice, dict):
+                    if 'message' in choice and isinstance(choice['message'], dict):
+                        content = choice['message'].get('content', '')
+                    elif 'text' in choice:
+                        content = choice['text']
+            elif 'content' in analysis:
+                content = analysis['content']
+            elif 'type' in analysis and 'text' in analysis:
+                # Handle the case where analysis is a dict with type and text keys
+                content = analysis['text']
+            else:
+                logger.error(f"Unexpected analysis format: {json.dumps(analysis, indent=2)}")
+                content = f"Error: Could not extract content from analysis result: {json.dumps(analysis, indent=2)}"
+        else:
+            content = str(analysis)
+        
+        # Final check if content is still a dict
+        if content is None:
+            content = "No analysis content found."
+        elif isinstance(content, dict):
+            logger.warning(f"Content is still a dictionary: {json.dumps(content, indent=2)}")
+            if 'text' in content:
+                content = content['text']
+            elif 'content' in content:
+                content = content['content']
+            else:
+                content = json.dumps(content, indent=2)
+        
+        # Now content should be a string, we can safely check if it's empty
+        if not content or (isinstance(content, str) and content.strip() == ""):
+            content = "No analysis content found."
+            
         if report_format == "markdown":
             report = content  # Already in markdown format
         elif report_format == "html":

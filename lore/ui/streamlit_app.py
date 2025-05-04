@@ -7,71 +7,92 @@ with support for GitHub repository URLs and interactive chat.
 import os
 import sys
 import logging
-import tempfile
 import shutil
+import atexit
+import re
+import tempfile
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+from dotenv import load_dotenv
 
 import streamlit as st
-from dotenv import load_dotenv
 import pandas as pd
 
-# Add the parent directory to the path to import lore modules
-sys.path.append(str(Path(__file__).parent.parent.parent))
-
-from lore.ingestion.git_extractor import GitExtractor
-from lore.ingestion.issue_extractor import IssueExtractor
 from lore.llm.llama_client import LlamaClient
 from lore.analysis.analyzer import RepositoryAnalyzer
-from lore.utils.text_processing import (
-    extract_file_extension_stats,
-    categorize_files,
-    truncate_text
-)
-from lore.utils.repo_utils import (
-    is_github_url,
-    extract_repo_info,
-    clone_github_repo
-)
+from lore.ingestion.git_extractor import GitExtractor
+from lore.ingestion.issue_extractor import IssueExtractor
 from lore.ui.chat_interface import RepoChat, ChatHistory
-
-# Load environment variables
-load_dotenv()
+from lore.utils.repo_utils import clone_github_repo, extract_repo_info
+from lore.utils.text_processing import extract_file_extension_stats, categorize_files, truncate_text
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-# Initialize session state
+# Load environment variables from .env file
+load_dotenv()
+
+# Define utility functions
+def is_github_url(url: str) -> bool:
+    """Check if a URL is a valid GitHub repository URL."""
+    return bool(re.match(r'https?://github\.com/[\w-]+/[\w.-]+/?.*', url))
+
 def init_session_state():
-    """Initialize Streamlit session state variables."""
-    if "analyzed" not in st.session_state:
-        st.session_state.analyzed = False
-    if "git_extractor" not in st.session_state:
-        st.session_state.git_extractor = None
-    if "analysis_result" not in st.session_state:
-        st.session_state.analysis_result = None
-    if "repo_stats" not in st.session_state:
-        st.session_state.repo_stats = None
-    if "task" not in st.session_state:
-        st.session_state.task = "analyze_architecture"
-    if "repo_source" not in st.session_state:
-        st.session_state.repo_source = "local"
-    if "github_url" not in st.session_state:
-        st.session_state.github_url = ""
-    if "temp_dir" not in st.session_state:
-        st.session_state.temp_dir = None
-    if "chat_initialized" not in st.session_state:
-        st.session_state.chat_initialized = False
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "repo_context" not in st.session_state:
-        st.session_state.repo_context = None
-    if "repo_chat" not in st.session_state:
-        st.session_state.repo_chat = None
+    """Initialize session state variables."""
+    # Initialize all session state variables at startup
+    default_state = {
+        # Core state
+        'analyzed': False,
+        'chat_initialized': False,
+        'chat_history': [],
+        'repo_stats': {},
+        'analysis_result': None,
+        'report': None,
+        'temp_dir': None,
+        
+        # API configuration
+        'api_key': os.environ.get("LLAMA_API_KEY", ""),
+        'api_base': os.environ.get("LLAMA_API_BASE", "https://api.llama.com/v1"),
+        'model': "Llama-4-Maverick-17B-128E-Instruct-FP8",
+        
+        # Repository configuration
+        'git_extractor': None,
+        'task': "analyze_architecture",
+        'repo_source': "local",
+        'github_url': "",
+        'repo_path': "",
+        'max_history': 500,
+        
+        # Issue/PR configuration
+        'include_issues': False,
+        'include_prs': False,
+        'platform': "github",
+        'repo_owner': "",
+        'repo_name': "",
+        
+        # Repository context
+        'repo_context': None,
+        'repo_chat': None
+    }
+    
+    # Initialize any missing state variables
+    for key, default_value in default_state.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+
+def cleanup():
+    """Clean up temporary files."""
+    try:
+        if hasattr(st.session_state, 'temp_dir') and st.session_state.temp_dir:
+            temp_dir = Path(st.session_state.temp_dir)
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temporary directory: {temp_dir}")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
+# Register cleanup function
+atexit.register(cleanup)
 
 def initialize_llm_client() -> Optional[LlamaClient]:
     """Initialize the Llama client."""
@@ -176,65 +197,62 @@ def analyze_repository():
             git_extractor = GitExtractor(repo_path, max_history=max_history)
             st.session_state.git_extractor = git_extractor
         
-        # Extract repository statistics
+        # Extract statistics
         with st.spinner("Extracting repository statistics..."):
-            repo_stats = extract_repo_stats(git_extractor)
-            st.session_state.repo_stats = repo_stats
+            stats = extract_repo_stats(git_extractor)
+            st.session_state.repo_stats = stats
         
-        # Initialize Llama client
+        # Initialize LLM client
         llm_client = initialize_llm_client()
         if not llm_client:
+            st.error("Failed to initialize LLM client. Please check your API key.")
             return
         
-        # Create temporary directory for output
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Initialize repository analyzer
-            analyzer = RepositoryAnalyzer(llm_client, output_dir=temp_dir)
+        # Initialize repository analyzer
+        analyzer = RepositoryAnalyzer(llm_client)
+        
+        # Prepare repository context
+        with st.spinner("Preparing repository context..."):
+            # Issue extractor
+            issue_extractor = None
+            if st.session_state.include_issues or st.session_state.include_prs:
+                try:
+                    issue_extractor = IssueExtractor(
+                        st.session_state.platform,
+                        repo_owner,
+                        repo_name
+                    )
+                except Exception as e:
+                    st.warning(f"Could not initialize issue extractor: {e}")
             
-            # Prepare repository context
-            with st.spinner("Preparing repository context..."):
-                # Initialize issue extractor if needed
-                issue_extractor = None
-                if st.session_state.include_issues or st.session_state.include_prs:
-                    if not repo_owner or not repo_name:
-                        st.warning("Repository owner and name required for issue/PR extraction")
-                        st.session_state.include_issues = False
-                        st.session_state.include_prs = False
-                    else:
-                        issue_extractor = IssueExtractor(platform=st.session_state.platform)
-                
-                context = analyzer.prepare_repository_context(
-                    git_extractor,
-                    issue_extractor=issue_extractor,
-                    repo_owner=repo_owner or st.session_state.repo_owner,
-                    repo_name=repo_name or st.session_state.repo_name,
-                    include_issues=st.session_state.include_issues,
-                    include_prs=st.session_state.include_prs
-                )
-                
-                # Store context for chat functionality
-                st.session_state.repo_context = context
-                
-                st.info(f"Repository context prepared ({len(context)} characters)")
+            # Prepare context
+            context = analyzer.prepare_repository_context(
+                git_extractor,
+                issue_extractor,
+                repo_owner,
+                repo_name,
+                st.session_state.include_issues,
+                st.session_state.include_prs
+            )
+            st.session_state.repo_context = context
+        
+        # Analyze repository
+        with st.spinner("Analyzing repository using Llama 4..."):
+            task = st.session_state.task
+            model = st.session_state.model
             
-            # Analyze repository
-            with st.spinner(f"Analyzing repository with task: {st.session_state.task}..."):
-                analysis = analyzer.analyze_repository(
-                    context, 
-                    task=st.session_state.task,
-                    model=st.session_state.model
-                )
-                st.session_state.analysis_result = analysis
+            # Create a temporary file to store the analysis
+            analysis = analyzer.analyze_repository(context, task=task, model=model)
+            st.session_state.analysis_result = analysis
             
             # Generate report
-            with st.spinner("Generating analysis report..."):
-                report = analyzer.generate_report(analysis, report_format="markdown")
-                st.session_state.report = report
-                
-                # Initialize chat functionality
-                if not st.session_state.chat_initialized:
-                    st.session_state.repo_chat = RepoChat(llm_client, analyzer, context)
-                    st.session_state.chat_initialized = True
+            report = analyzer.generate_report(analysis, report_format="markdown")
+            st.session_state.report = report
+            
+            # Initialize chat functionality
+            if not st.session_state.chat_initialized:
+                st.session_state.repo_chat = RepoChat(llm_client, analyzer, context)
+                st.session_state.chat_initialized = True
         
         st.session_state.analyzed = True
         st.success("Repository analysis completed successfully!")
@@ -273,15 +291,6 @@ def handle_chat():
                 # Add to history for display
                 st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-def cleanup():
-    """Clean up temporary directories."""
-    if st.session_state.temp_dir and Path(st.session_state.temp_dir).exists():
-        try:
-            shutil.rmtree(st.session_state.temp_dir)
-            st.session_state.temp_dir = None
-        except Exception as e:
-            logger.error(f"Error cleaning up temporary directory: {e}")
-
 def main():
     """Main Streamlit application."""
     st.set_page_config(
@@ -304,20 +313,18 @@ def main():
         
         # API configuration
         st.subheader("Llama API")
-        st.session_state.api_key = st.text_input(
-            "API Key", 
-            value=os.environ.get("LLAMA_API_KEY", ""), 
-            type="password"
-        )
-        st.session_state.api_base = st.text_input(
-            "API Base URL",
-            value=os.environ.get("LLAMA_API_BASE", "https://api.llama.com/v1")
-        )
-        st.session_state.model = st.selectbox(
-            "Model",
-            ["Llama-4-Maverick-17B-128E-Instruct-FP8"],
+        api_key = st.text_input("API Key", value=st.session_state.api_key, type="password")
+        api_base = st.text_input("API Base URL", value=st.session_state.api_base)
+        model = st.selectbox(
+            "Model", 
+            ["Llama-4-Maverick-17B-128E-Instruct-FP8", "llama-2-70b-chat"],
             index=0
         )
+        
+        # Update session state
+        st.session_state.api_key = api_key
+        st.session_state.api_base = api_base
+        st.session_state.model = model
         
         # Repository configuration
         st.subheader("Repository")
@@ -351,7 +358,9 @@ def main():
             "Analysis Task",
             options=[
                 "analyze_architecture",
+                "analyze_complexity",
                 "historical_analysis",
+                "chat",
                 "onboarding",
                 "refactoring_guide",
                 "dependency_analysis"
@@ -421,7 +430,10 @@ def main():
         
         with tab1:
             # Display the analysis report
-            st.markdown(st.session_state.report)
+            if not st.session_state.report:
+                st.warning("No analysis report available. Please run the analysis first.")
+            else:
+                st.markdown(st.session_state.report)
         
         with tab2:
             # Display repository statistics
@@ -472,7 +484,7 @@ def main():
                         {'Date': repo_stats["commit_dates"]}
                     )
                     dates_df['Count'] = 1
-                    dates_df = dates_df.set_index('Date').resample('M').sum()
+                    dates_df = dates_df.set_index('Date').resample('ME').sum()
                     st.line_chart(dates_df)
         
         with tab3:
@@ -486,16 +498,59 @@ def main():
         with tab4:
             # Display raw data
             st.subheader("Analysis Result")
-            if 'choices' in st.session_state.analysis_result:
-                content = st.session_state.analysis_result['choices'][0]['message']['content']
-                st.json({
-                    'model': st.session_state.analysis_result.get('model', 'unknown'),
-                    'content_length': len(content),
-                    'content_preview': truncate_text(content, 500)
-                })
+            if st.session_state.analysis_result:
+                try:
+                    # Extract content and metadata
+                    raw_data = {
+                        "model": st.session_state.analysis_result.get("model", st.session_state.model),
+                        "content_length": 0,
+                        "content_preview": "",
+                        "metrics": {
+                            "tokens": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0
+                        },
+                        "response_format": {
+                            "type": "markdown",
+                            "version": "1.0"
+                        }
+                    }
+                    
+                    # Extract content from various response formats
+                    content = None
+                    if "completion_message" in st.session_state.analysis_result:
+                        content = st.session_state.analysis_result["completion_message"].get("content", "")
+                    elif "choices" in st.session_state.analysis_result and st.session_state.analysis_result["choices"]:
+                        choice = st.session_state.analysis_result["choices"][0]
+                        if isinstance(choice, dict):
+                            if "message" in choice:
+                                content = choice["message"].get("content", "")
+                            elif "text" in choice:
+                                content = choice["text"]
+                    
+                    if content:
+                        raw_data["content_length"] = len(content)
+                        raw_data["content_preview"] = truncate_text(content, 500)
+                    
+                    # Extract metrics
+                    if "metrics" in st.session_state.analysis_result:
+                        raw_data["metrics"] = st.session_state.analysis_result["metrics"]
+                    elif "usage" in st.session_state.analysis_result:
+                        raw_data["metrics"] = {
+                            "tokens": st.session_state.analysis_result["usage"].get("total_tokens", 0),
+                            "prompt_tokens": st.session_state.analysis_result["usage"].get("prompt_tokens", 0),
+                            "completion_tokens": st.session_state.analysis_result["usage"].get("completion_tokens", 0)
+                        }
+                    
+                    # Display formatted JSON
+                    st.json(raw_data)
+                except Exception as e:
+                    logger.error(f"Error formatting raw data: {e}")
+                    st.error("Error formatting raw data. Showing original response:")
+                    st.json(st.session_state.analysis_result)
             else:
-                st.json(st.session_state.analysis_result)
-
+                st.warning("No analysis result available")
+    
     # Clean up resources when the user navigates away
     import atexit
     atexit.register(cleanup)

@@ -77,9 +77,18 @@ class RepoChat:
         self.system_prompt = (
             "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant "
             "that helps developers understand codebases. You have been provided with the repository context. "
-            "Provide clear, concise, and accurate answers. Keep responses focused and relevant to the "
-            "questions asked. If you don't know something, say so directly. End your response when you've "
-            "fully answered the question."
+            "\n\nWhen analyzing commits, PRs, or code changes:\n"
+            "1. ALWAYS list ALL files that were modified in the commit/PR - MAKE SURE YOU LIST EVERY SINGLE FILE\n"
+            "2. Group files by their directory structure\n"
+            "3. For each file show:\n"
+            "   - Full file path\n"
+            "   - Number of lines added and removed\n"
+            "   - A brief description of what changed\n"
+            "4. Include the commit message and any PR description\n"
+            "5. If multiple commits are involved, show the changes from each commit\n"
+            "6. IMPORTANT: Double-check that you've actually listed ALL files mentioned in the context\n"
+            "7. DO NOT assume files are unchanged or skip listing them - explicitly list every file that was changed\n"
+            "\nProvide clear, concise, and accurate answers. If you don't know something, say so directly."
         )
     
     def chat(self, user_message: str, stream: bool = False) -> str:
@@ -99,29 +108,38 @@ class RepoChat:
                 {
                     "role": "system",
                     "content": self.system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_message
                 }
             ]
             
-            # Add context message if we have repository context
+            # Add repository context with better structure
             if self.repo_context:
-                messages.insert(1, {
+                messages.append({
                     "role": "system",
-                    "content": f"Repository context:\n{self.repo_context}"
+                    "content": (
+                        "Repository Analysis Context:\n"
+                        "Here is the detailed repository context including all commits, "
+                        "file changes, and documentation. Pay special attention to the "
+                        "RECENT SIGNIFICANT COMMITS section which shows all file changes:\n\n"
+                        f"{self.repo_context}"
+                    )
                 })
-
+            
+            # Add user message
+            messages.append({
+                "role": "user",
+                "content": user_message
+            })
+            
             logger.debug(f"Sending chat request with messages: {json.dumps(messages, indent=2)}")
             
+            # Use the best model with maximum context and tokens
             response = self.llm_client.analyze_repository(
                 content="",  # Not used when providing messages
-                model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+                model="Llama-4-Maverick-17B-128E-Instruct-FP8",  # Best model for code analysis
                 temperature=0.2,  # Lower temperature for more focused responses
-                max_tokens=1000,  # Limit response length
-                task="chat",  # Custom task for chat
-                messages=messages  # Pass the messages
+                max_tokens=10000,  # Maximum token limit
+                task="chat",
+                messages=messages
             )
             
             logger.debug(f"Response received: {json.dumps(response, indent=2)}")

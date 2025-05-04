@@ -4,6 +4,7 @@ Chat interface for LORE.
 This module provides functionality for chatting with a repository using the Llama API.
 """
 import logging
+import json
 from typing import List, Dict, Any, Optional
 
 from ..llm.llama_client import LlamaClient
@@ -75,9 +76,10 @@ class RepoChat:
         # Initialize with system prompt
         self.system_prompt = (
             "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant "
-            "that helps developers understand codebases. You have been provided with the full context "
-            "of a repository including its code, Git history, documentation, and potentially issues and PRs. "
-            "Answer questions about the codebase based on this context. If you don't know the answer, say so."
+            "that helps developers understand codebases. You have been provided with the repository context. "
+            "Provide clear, concise, and accurate answers. Keep responses focused and relevant to the "
+            "questions asked. If you don't know something, say so directly. End your response when you've "
+            "fully answered the question."
         )
     
     def chat(self, user_message: str, stream: bool = False) -> str:
@@ -85,60 +87,79 @@ class RepoChat:
         Send a message to the chat interface and get a response.
         
         Args:
-            user_message: User message
+            user_message: Message from the user
             stream: Whether to stream the response
             
         Returns:
-            Assistant response
+            Response from the assistant
         """
-        # Add user message to history
-        self.chat_history.add_message("user", user_message)
-        
-        # Prepare messages for the API call
-        messages = [
-            {"role": "system", "content": self.system_prompt}
-        ]
-        
-        # Add repository context as a system message
-        # We'll use a truncated version to avoid exceeding token limits
-        truncated_context = self.repo_context[:500000]  # 500K chars, adjust based on model
-        messages.append({
-            "role": "system", 
-            "content": f"Repository context:\n\n{truncated_context}"
-        })
-        
-        # Add chat history
-        messages.extend(self.chat_history.get_history()[:-1])  # Exclude the most recent user message
-        
-        # Add the latest user message with explicit instruction
-        messages.append({
-            "role": "user",
-            "content": f"Based on the repository information provided, {user_message}"
-        })
-        
         try:
-            if stream:
-                response = self.llm_client.stream_analysis(
-                    content="",  # Not used when providing messages
-                    model="llama-4-10m",
-                    temperature=0.7,
-                    max_tokens=2000,
-                    task="chat"  # Custom task for chat
-                )
-                assistant_message = response.get("content", "")
-            else:
-                response = self.llm_client.analyze_repository(
-                    content="",  # Not used when providing messages
-                    model="llama-4-10m",
-                    temperature=0.7,
-                    max_tokens=2000,
-                    task="chat"  # Custom task for chat
-                )
-                
-                if 'choices' in response and len(response['choices']) > 0:
-                    assistant_message = response['choices'][0]['message']['content']
+            # Construct messages array with proper schema
+            messages = [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ]
+            
+            # Add context message if we have repository context
+            if self.repo_context:
+                messages.insert(1, {
+                    "role": "system",
+                    "content": f"Repository context:\n{self.repo_context}"
+                })
+
+            logger.debug(f"Sending chat request with messages: {json.dumps(messages, indent=2)}")
+            
+            response = self.llm_client.analyze_repository(
+                content="",  # Not used when providing messages
+                model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+                temperature=0.2,  # Lower temperature for more focused responses
+                max_tokens=1000,  # Limit response length
+                task="chat",  # Custom task for chat
+                messages=messages  # Pass the messages
+            )
+            
+            logger.debug(f"Response received: {json.dumps(response, indent=2)}")
+            
+            # Handle Llama API response format
+            if 'completion_message' in response:
+                completion = response['completion_message']
+                if 'content' in completion:
+                    content = completion['content']
+                    if isinstance(content, dict) and 'text' in content:
+                        assistant_message = content['text']
+                        logger.debug(f"Found message in Llama format: {assistant_message}")
+                    else:
+                        assistant_message = str(content)
+                        logger.debug(f"Found raw content: {assistant_message}")
                 else:
-                    assistant_message = "I'm sorry, I couldn't generate a response."
+                    logger.error(f"No content in completion message: {completion}")
+                    assistant_message = "I'm sorry, I couldn't generate a response. The API response was missing content."
+            # Fallback to OpenAI format
+            elif 'choices' in response and len(response['choices']) > 0:
+                choice = response['choices'][0]
+                logger.debug(f"First choice: {json.dumps(choice, indent=2)}")
+                
+                if 'message' in choice and 'content' in choice['message']:
+                    assistant_message = choice['message']['content']
+                    logger.debug(f"Found message in OpenAI format: {assistant_message}")
+                elif 'text' in choice:
+                    assistant_message = choice['text']
+                    logger.debug(f"Found message in text format: {assistant_message}")
+                elif 'content' in choice:
+                    assistant_message = choice['content']
+                    logger.debug(f"Found message in content format: {assistant_message}")
+                else:
+                    logger.error(f"Unexpected choice format. Available keys: {list(choice.keys())}")
+                    assistant_message = "I'm sorry, I couldn't generate a response. The API response format was unexpected."
+            else:
+                logger.error(f"No completion_message or choices in response. Full response: {response}")
+                assistant_message = "I'm sorry, I couldn't generate a response. The API response was missing the expected data."
             
             # Add assistant message to history
             self.chat_history.add_message("assistant", assistant_message)

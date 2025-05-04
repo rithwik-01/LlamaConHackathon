@@ -12,6 +12,7 @@ import requests
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 class LlamaClient:
     """Client for interacting with the Llama 4 API."""
@@ -26,7 +27,10 @@ class LlamaClient:
                       or https://api.llama.ai/v1)
         """
         self.api_key = api_key or os.environ.get("LLAMA_API_KEY")
-        self.api_base = api_base or os.environ.get("LLAMA_API_BASE", "https://api.llama.ai/v1")
+        self.api_base = api_base or os.environ.get("LLAMA_API_BASE", "https://api.llama.com/v1")
+        
+        logger.debug(f"API Key: {self.api_key}")
+        logger.debug(f"API Base: {self.api_base}")
         
         if not self.api_key:
             raise ValueError("Llama API key not provided")
@@ -48,107 +52,170 @@ class LlamaClient:
             "Authorization": f"Bearer {self.api_key}"
         }
         
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        
-        return response.json()
-    
-    def analyze_repository(self, 
-                          content: str, 
-                          model: str = "llama-4-10m", 
-                          temperature: float = 0.2,
-                          max_tokens: int = 8000,
-                          task: str = "analyze_architecture",
-                          messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-        """
-        Send repository data to Llama for analysis.
-        
-        Args:
-            content: Repository content to analyze
-            model: Llama model to use (defaults to llama-4-10m)
-            temperature: Sampling temperature (0.0 to 1.0)
-            max_tokens: Maximum tokens to generate
-            task: Analysis task to perform
-            messages: Optional list of messages for chat mode
-            
-        Returns:
-            Llama API response
-        """
-        # Define system prompts based on task
-        system_prompts = {
-            "analyze_architecture": (
-                "You are an expert software architect analyzing a codebase. "
-                "Provide a comprehensive analysis of the repository architecture, "
-                "design patterns, and code organization. Identify strengths, weaknesses, "
-                "architectural drift, and anti-patterns."
-            ),
-            "historical_analysis": (
-                "You are an expert software historian examining the evolution of a codebase. "
-                "Analyze the commit history, changes over time, and key developmental milestones. "
-                "Identify important architectural decisions, pivots, and the reasoning behind them."
-            ),
-            "onboarding": (
-                "You are an expert software developer creating comprehensive documentation "
-                "for new team members. Create an onboarding guide that explains the repository "
-                "structure, key components, workflow, and development practices."
-            ),
-            "refactoring_guide": (
-                "You are an expert software refactoring consultant. Examine the codebase "
-                "and provide a detailed refactoring plan. Identify areas that need improvement, "
-                "technical debt, and prioritized actionable steps for refactoring."
-            ),
-            "dependency_analysis": (
-                "You are an expert software architect analyzing dependencies. "
-                "Map out all internal and external dependencies in the codebase, "
-                "highlight critical paths, identify tight coupling, and suggest "
-                "improvements for better modularity."
-            ),
-            "chat": (
-                "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant "
-                "that helps developers understand codebases. You have been provided with the full context "
-                "of a repository including its code, Git history, documentation, and potentially issues and PRs. "
-                "Answer questions about the codebase based on this context. Be specific and reference relevant "
-                "parts of the code when appropriate. If you don't know the answer, say so."
-            )
-        }
-        
-        # Use default if task not found
-        system_prompt = system_prompts.get(
-            task, 
-            "You are an expert software engineer analyzing a repository. "
-            "Provide comprehensive analysis and insights about the codebase."
-        )
-        
-        # Prepare the request payload
-        if messages is not None:
-            # Use provided messages for chat mode
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens
-            }
-        else:
-            # Use standard format for analysis
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content}
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens
-            }
+        logger.debug("=== API Request Details ===")
+        logger.debug(f"URL: {url}")
+        logger.debug(f"Headers: {headers}")
+        logger.debug(f"Payload: {json.dumps(data, indent=2)}")
         
         try:
+            logger.debug("Sending POST request to API...")
+            response = requests.post(url, headers=headers, json=data)
+            
+            logger.debug("=== API Response Details ===")
+            logger.debug(f"Status Code: {response.status_code}")
+            logger.debug(f"Response Headers: {dict(response.headers)}")
+            
+            try:
+                response_json = response.json()
+                logger.debug(f"Response Body: {json.dumps(response_json, indent=2)}")
+                
+                # Transform response to OpenAI format if needed
+                if 'choices' in response_json and len(response_json['choices']) > 0:
+                    choice = response_json['choices'][0]
+                    if 'text' in choice and 'message' not in choice:
+                        # Clean up response text
+                        sanitized_text = self._sanitize_response(choice['text'])
+                        # Convert to OpenAI format
+                        choice['message'] = {'content': sanitized_text}
+                        del choice['text']
+                    elif 'content' in choice and 'message' not in choice:
+                        # Clean up response text
+                        sanitized_text = self._sanitize_response(choice['content'])
+                        # Convert to OpenAI format
+                        choice['message'] = {'content': sanitized_text}
+                        del choice['content']
+                    elif 'message' in choice and 'content' in choice['message']:
+                        # Clean up response text in OpenAI format
+                        choice['message']['content'] = self._sanitize_response(choice['message']['content'])
+                
+                return response_json
+                
+            except json.JSONDecodeError:
+                logger.error("Failed to parse response as JSON")
+                logger.debug(f"Raw Response Text: {response.text}")
+                raise
+            
+            response.raise_for_status()
+            return response_json
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {str(e)}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Error response body: {e.response.text}")
+            raise
+    
+    def _sanitize_response(self, text: str) -> str:
+        """
+        Sanitize the response text to remove repetitive patterns and truncate if too long.
+        """
+        if not text:
+            return text
+            
+        # Detect repetitive patterns (3 or more repetitions)
+        pattern_length = 10  # Look for patterns of this length or longer
+        for i in range(pattern_length, len(text) // 2):
+            pattern = text[0:i]
+            if text.count(pattern) >= 3:
+                # Found a repetitive pattern, truncate at first occurrence
+                end_idx = text.find(pattern) + len(pattern)
+                return text[:end_idx]
+                
+        # Check for repetitive code blocks
+        if text.count('```python') > 2:
+            # Too many code blocks, truncate after second one
+            parts = text.split('```python')
+            return '```python'.join(parts[:3])
+            
+        return text
+        
+    SYSTEM_PROMPTS = {
+        "analyze_architecture": (
+            "You are an expert software architect analyzing a codebase. "
+            "Provide a comprehensive analysis of the repository architecture, design patterns, "
+            "and code organization. Identify strengths, weaknesses, architectural drift, and anti-patterns. "
+            "Focus on high-level insights and avoid generating code snippets unless specifically asked. "
+            "Keep responses concise and to the point."
+        ),
+        "analyze_history": (
+            "You are an expert in software development history analysis. "
+            "Analyze the Git history to understand the evolution of the codebase, key milestones, "
+            "and development patterns. Focus on meaningful insights about code changes and development "
+            "trends. Avoid generating code snippets. Keep responses concise and to the point."
+        ),
+        "chat": (
+            "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant "
+            "that helps developers understand codebases. You have been provided with the repository context. "
+            "Provide clear, concise, and accurate answers. Keep responses focused and relevant to the "
+            "questions asked. If you don't know something, say so directly. Do not generate code unless "
+            "specifically asked. End your response when you've fully answered the question."
+        )
+    }
+    
+    def analyze_repository(
+        self,
+        content: str,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
+        task: str = "analyze_architecture",
+        messages: Optional[List[Dict[str, str]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Analyze a repository using the Llama API.
+        
+        Args:
+            content: Content to analyze
+            model: Model to use
+            temperature: Temperature for generation
+            max_tokens: Maximum tokens to generate
+            task: Task type (analyze_architecture, historical_analysis, etc.)
+            messages: Optional list of chat messages
+            
+        Returns:
+            API response
+        """
+        try:
+            if messages is not None:
+                logger.debug("Using provided messages for chat mode")
+                # Validate message format
+                for msg in messages:
+                    if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
+                        raise ValueError("Each message must be a dict with 'role' and 'content' keys")
+                    if msg['role'] not in ['system', 'user', 'assistant']:
+                        raise ValueError("Message role must be one of: system, user, assistant")
+                
+                # Use provided messages for chat mode
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stop": ["<|end|>"]  # Add stop sequence
+                }
+            else:
+                logger.debug("Using standard format for analysis")
+                # Use standard format for analysis
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": self.SYSTEM_PROMPTS.get(task, self.SYSTEM_PROMPTS["analyze_architecture"])},
+                        {"role": "user", "content": content}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stop": ["<|end|>"]  # Add stop sequence
+                }
+            
+            logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
             return self._make_request("chat/completions", payload)
+            
         except Exception as e:
-            logger.error(f"Error calling Llama API: {e}")
+            logger.error(f"Error in analyze_repository: {str(e)}")
             raise
     
     def stream_analysis(self, 
                        content: str, 
-                       model: str = "llama-4-10m", 
+                       model: str = "Llama-4-Maverick-17B-128E-Instruct-FP8", 
                        temperature: float = 0.2,
                        max_tokens: int = 8000,
                        task: str = "analyze_architecture",
@@ -158,11 +225,11 @@ class LlamaClient:
         
         Args:
             content: Repository content to analyze
-            model: Llama model to use (defaults to llama-4-10m)
+            model: Llama model to use (defaults to Llama-4-Maverick-17B-128E-Instruct-FP8)
             temperature: Sampling temperature (0.0 to 1.0)
             max_tokens: Maximum tokens to generate
             task: Analysis task to perform
-            messages: Optional list of messages for chat mode
+            messages: Optional list of chat messages for chat mode
             
         Returns:
             Complete response after streaming
@@ -171,37 +238,23 @@ class LlamaClient:
         system_prompts = {
             "analyze_architecture": (
                 "You are an expert software architect analyzing a codebase. "
-                "Provide a comprehensive analysis of the repository architecture, "
-                "design patterns, and code organization. Identify strengths, weaknesses, "
-                "architectural drift, and anti-patterns."
+                "Provide a comprehensive analysis of the repository architecture, design patterns, "
+                "and code organization. Identify strengths, weaknesses, architectural drift, and anti-patterns. "
+                "Focus on high-level insights and avoid generating code snippets unless specifically asked. "
+                "Keep responses concise and to the point."
             ),
-            "historical_analysis": (
-                "You are an expert software historian examining the evolution of a codebase. "
-                "Analyze the commit history, changes over time, and key developmental milestones. "
-                "Identify important architectural decisions, pivots, and the reasoning behind them."
-            ),
-            "onboarding": (
-                "You are an expert software developer creating comprehensive documentation "
-                "for new team members. Create an onboarding guide that explains the repository "
-                "structure, key components, workflow, and development practices."
-            ),
-            "refactoring_guide": (
-                "You are an expert software refactoring consultant. Examine the codebase "
-                "and provide a detailed refactoring plan. Identify areas that need improvement, "
-                "technical debt, and prioritized actionable steps for refactoring."
-            ),
-            "dependency_analysis": (
-                "You are an expert software architect analyzing dependencies. "
-                "Map out all internal and external dependencies in the codebase, "
-                "highlight critical paths, identify tight coupling, and suggest "
-                "improvements for better modularity."
+            "analyze_history": (
+                "You are an expert in software development history analysis. "
+                "Analyze the Git history to understand the evolution of the codebase, key milestones, "
+                "and development patterns. Focus on meaningful insights about code changes and development "
+                "trends. Avoid generating code snippets. Keep responses concise and to the point."
             ),
             "chat": (
                 "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant "
-                "that helps developers understand codebases. You have been provided with the full context "
-                "of a repository including its code, Git history, documentation, and potentially issues and PRs. "
-                "Answer questions about the codebase based on this context. Be specific and reference relevant "
-                "parts of the code when appropriate. If you don't know the answer, say so."
+                "that helps developers understand codebases. You have been provided with the repository context. "
+                "Provide clear, concise, and accurate answers. Keep responses focused and relevant to the "
+                "questions asked. If you don't know something, say so directly. Do not generate code unless "
+                "specifically asked. End your response when you've fully answered the question."
             )
         }
         
@@ -241,6 +294,10 @@ class LlamaClient:
             "Authorization": f"Bearer {self.api_key}"
         }
         
+        logger.debug(f"Request URL: {url}")
+        logger.debug(f"Request Headers: {headers}")
+        logger.debug(f"Request Payload: {json.dumps(payload, indent=2)}")
+        
         full_response = ""
         
         try:
@@ -273,7 +330,7 @@ class LlamaClient:
     
     def chunk_and_analyze(self, 
                          content: str,
-                         model: str = "llama-4-10m",
+                         model: str = "Llama-4-Maverick-17B-128E-Instruct-FP8",
                          chunk_size: int = 100000,
                          overlap: int = 5000,
                          task: str = "analyze_architecture") -> List[Dict[str, Any]]:

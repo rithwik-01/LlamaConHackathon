@@ -311,11 +311,11 @@ def main():
         )
         st.session_state.api_base = st.text_input(
             "API Base URL",
-            value=os.environ.get("LLAMA_API_BASE", "https://api.llama.ai/v1")
+            value=os.environ.get("LLAMA_API_BASE", "https://api.llama.com/v1")
         )
         st.session_state.model = st.selectbox(
             "Model",
-            options=["llama-4-10m", "llama-4-1m"],
+            ["Llama-4-Maverick-17B-128E-Instruct-FP8"],
             index=0
         )
         

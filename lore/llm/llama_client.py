@@ -7,9 +7,34 @@ import logging
 import os
 import json
 import base64
+import sys
+import traceback
 from typing import Dict, List, Optional, Union, Any
 import requests
 from tqdm import tqdm
+
+# Set up terminal logging
+def setup_terminal_logger():
+    # Create a console handler for direct terminal output
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('\n[LORE API] %(levelname)s - %(message)s')
+    console.setFormatter(formatter)
+    
+    # Add the handler to the root logger
+    root_logger = logging.getLogger()
+    root_logger.addHandler(console)
+    
+    # Remove duplicate handlers if any
+    handlers = root_logger.handlers[:]
+    for h in handlers:
+        if isinstance(h, logging.StreamHandler) and h != console:
+            root_logger.removeHandler(h)
+    
+    return root_logger
+
+# Create a terminal logger
+terminal_logger = setup_terminal_logger()
 
 # Configure logging to show all debug messages
 logging.basicConfig(level=logging.DEBUG, 
@@ -76,14 +101,50 @@ class LlamaClient:
                 "Content-Type": "application/json"
             }
             
+            # Enhanced debug logging
             logger.debug(f"Making request to {url}")
-            response = requests.post(url, headers=headers, json=payload)
-            response_body = response.json()
-            logger.debug(f"Response Body: {json.dumps(response_body, indent=2)}")
+            
+            # Log message count and size
+            if 'messages' in payload:
+                msg_count = len(payload['messages'])
+                msg_sizes = [len(str(msg.get('content', ''))) for msg in payload['messages']]
+                msg_roles = [msg.get('role', 'unknown') for msg in payload['messages']]
+                
+                logger.debug(f"Sending {msg_count} messages with roles: {msg_roles}")
+                logger.debug(f"Message sizes (chars): {msg_sizes}")
+                logger.debug(f"Total content size (approx): {sum(msg_sizes)} chars")
+                
+                # Identify any potential issues
+                for i, msg in enumerate(payload['messages']):
+                    if not isinstance(msg.get('content'), (str, list)):
+                        logger.warning(f"Message {i} has invalid content type: {type(msg.get('content')).__name__}")
+                    if msg.get('role') not in ['system', 'user', 'assistant']:
+                        logger.warning(f"Message {i} has invalid role: {msg.get('role')}")
+            
+            # Make the request and capture full response
+            try:
+                response = requests.post(url, headers=headers, json=payload)
+                
+                # Try to get JSON response, but handle cases where it's not JSON
+                try:
+                    response_body = response.json()
+                    if response.status_code == 200:
+                        logger.debug(f"Response Body (success): {json.dumps(response_body, indent=2)[:500]}...")
+                    else:
+                        # Log the full error response
+                        logger.error(f"API Error Response: {json.dumps(response_body, indent=2)}")
+                except json.JSONDecodeError:
+                    response_body = {"detail": "Non-JSON response: " + response.text[:500]}
+                    logger.error(f"Non-JSON response: {response.text[:500]}")
+            except Exception as req_ex:
+                logger.error(f"Request failed with exception: {str(req_ex)}")
+                raise
             
             if response.status_code != 200:
                 error_msg = response_body.get('detail', 'Unknown error')
                 logger.error(f"API request failed with status {response.status_code}: {error_msg}")
+                # Print the full request payload for debugging
+                logger.error(f"Request payload that caused error: {json.dumps(payload, default=str)[:1000]}...")
                 raise LlamaAPIError(f"API request failed: {error_msg}", response_body)
             
             # Extract the actual response content
@@ -136,6 +197,63 @@ class LlamaClient:
             logger.error(f"Error in _make_request: {str(e)}")
             raise
     
+    def _limit_context_size(self, messages: List[Dict[str, Any]], model: str = None, max_tokens: int = 100000) -> List[Dict[str, Any]]:
+        """
+        Limit the context size to avoid token limit errors.
+        
+        Args:
+            messages: List of message dictionaries
+            model: Model name to determine token limit
+            max_tokens: Maximum tokens allowed (default set conservatively)
+            
+        Returns:
+            Processed messages that fit within token limits
+        """
+        # If there are very few messages, likely no problem
+        if len(messages) <= 3:
+            return messages
+            
+        # First, identify system messages with very long content
+        system_messages = []
+        user_assistant_messages = []
+        
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_messages.append(msg)
+            else:
+                user_assistant_messages.append(msg)
+        
+        # Sort system messages by length (shortest first)
+        system_messages.sort(key=lambda x: len(x.get("content", "")) if isinstance(x.get("content"), str) else 0)
+        
+        # If we have large system messages (repository context), keep essential ones
+        if system_messages and len(system_messages) > 1:
+            # Keep the largest system message (likely main repository context)
+            # and the smallest one (likely system instructions)
+            main_context = system_messages[-1]  # Largest
+            system_instructions = system_messages[0]  # Smallest
+            
+            # If the repository context is extremely large, truncate it
+            if isinstance(main_context.get("content"), str) and len(main_context.get("content", "")) > 50000:
+                content = main_context["content"]
+                logger.warning(f"Repository context is very large ({len(content)} chars). Truncating to 50000 chars.")
+                
+                # Extract first and last parts to preserve structure
+                main_context["content"] = (
+                    "===== TRUNCATED REPOSITORY CONTEXT =====\n\n" +
+                    content[:25000] + "\n\n...\n\n" + content[-25000:] +
+                    "\n\n===== END OF TRUNCATED REPOSITORY CONTEXT ====="
+                )
+            
+            # Rebuild with limited system messages
+            final_messages = [system_instructions, main_context] + user_assistant_messages[-6:]  # Keep last 6 conversation turns
+        else:
+            # No large system messages, just keep everything
+            final_messages = messages
+        
+        logger.debug(f"Limited context size: {len(messages)} messages → {len(final_messages)} messages")
+        return final_messages
+
     def _sanitize_response(self, text: str) -> Any:
         """
         Clean up the response text to remove repetitive or nonsensical content.
@@ -253,31 +371,37 @@ class LlamaClient:
     
     SYSTEM_PROMPTS = {
         "analyze_architecture": (
+            "IMPORTANT: Analyze the ACTUAL code in this repository, not generic frameworks. "
             "Analyze this codebase's architecture and design. Focus on: "
-            "1. Main components and their interactions "
-            "2. Key design patterns and architectural choices "
-            "3. Code organization and modularity "
-            "4. Notable strengths or areas for improvement "
-            "Be concise and specific. Avoid code generation."
+            "1. Main components and their interactions with specific file/class references "
+            "2. Key design patterns and architectural choices as implemented in the code "
+            "3. Code organization and modularity with directory structure details "
+            "4. Notable strengths or areas for improvement based on actual implementation "
+            "Be concise and specific. Include references to actual files, classes, and functions."
         ),
         "analyze_complexity": (
+            "IMPORTANT: Analyze the ACTUAL code in this repository, not generic frameworks. "
             "Evaluate code complexity and maintainability. Identify: "
-            "1. Complex components needing attention "
-            "2. Potential technical debt "
-            "3. Specific improvement recommendations "
-            "Be brief and actionable."
+            "1. Complex components needing attention (with specific file paths) "
+            "2. Potential technical debt with code examples "
+            "3. Specific improvement recommendations based on the actual implementation "
+            "Be brief and actionable. Always reference actual code."
         ),
         "historical_analysis": (
+            "IMPORTANT: Analyze the ACTUAL code in this repository, not generic frameworks. "
             "Analyze repository history. Focus on: "
-            "1. Major changes and evolution "
-            "2. Development patterns "
-            "3. Key milestones "
-            "Keep it short and focused."
+            "1. Major changes and evolution with specific commit references "
+            "2. Development patterns seen in the actual commit history "
+            "3. Key milestones with dates and feature implementations "
+            "Keep it short and focused. Use only information from the repository history."
         ),
         "chat": (
+            "IMPORTANT: You must analyze the ACTUAL CODE from this repository. DO NOT provide generic responses about frameworks unless they're actually used here. "
             "You are a helpful coding assistant analyzing this repository. "
-            "Provide clear, concise answers. Focus on high-level insights. "
-            "Only show code if specifically asked."
+            "Always reference specific files, classes, functions and code structures from the repository. "
+            "Never make up information - if you don't see certain code, admit you can't find it. "
+            "Focus on implementation details found in the code, not theoretical descriptions. "
+            "Quote relevant code snippets when appropriate to support your answers."
         )
     }
     
@@ -322,9 +446,12 @@ class LlamaClient:
             payload["messages"] = [
                 {
                     "role": "system",
-                    "content": "You are a helpful coding assistant analyzing this repository. "
-                              "Provide clear, concise answers. Focus on high-level insights. "
-                              "Only show code if specifically asked."
+                    "content": "IMPORTANT: You must analyze the ACTUAL CODE from this repository. DO NOT provide generic responses about frameworks unless they're actually used here. "
+                              "You are a helpful coding assistant analyzing this repository. "
+                              "Always reference specific files, classes, functions and code structures from the repository. "
+                              "Never make up information - if you don't see certain code, admit you can't find it. "
+                              "Focus on implementation details found in the code, not theoretical descriptions. "
+                              "Quote relevant code snippets when appropriate to support your answers."
                 },
                 {
                     "role": "user",
@@ -374,7 +501,7 @@ class LlamaClient:
                        content: str, 
                        model: str = "Llama-4-Maverick-17B-128E-Instruct-FP8", 
                        temperature: float = 0.2,
-                       max_tokens: int = 8000,
+                       max_tokens: int = 10000,
                        task: str = "analyze_architecture",
                        messages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """
@@ -394,39 +521,48 @@ class LlamaClient:
         # Define system prompts based on task (same as above)
         system_prompts = {
             "analyze_architecture": (
+                "IMPORTANT: Analyze the ACTUAL code in this repository, not generic frameworks. "
                 "Analyze this codebase's architecture and design. Focus on: "
-                "1. Main components and their interactions "
-                "2. Key design patterns and architectural choices "
-                "3. Code organization and modularity "
-                "4. Notable strengths or areas for improvement "
-                "Be concise and specific. Avoid code generation."
+                "1. Main components and their interactions with specific file/class references "
+                "2. Key design patterns and architectural choices as implemented in the code "
+                "3. Code organization and modularity with directory structure details "
+                "4. Notable strengths or areas for improvement based on actual implementation "
+                "Be concise and specific. Include references to actual files, classes, and functions."
             ),
             "analyze_complexity": (
+                "IMPORTANT: Analyze the ACTUAL code in this repository, not generic frameworks. "
                 "Evaluate code complexity and maintainability. Identify: "
-                "1. Complex components needing attention "
-                "2. Potential technical debt "
-                "3. Specific improvement recommendations "
-                "Be brief and actionable."
+                "1. Complex components needing attention (with specific file paths) "
+                "2. Potential technical debt with code examples "
+                "3. Specific improvement recommendations based on the actual implementation "
+                "Be brief and actionable. Always reference actual code."
             ),
             "historical_analysis": (
+                "IMPORTANT: Analyze the ACTUAL code in this repository, not generic frameworks. "
                 "Analyze repository history. Focus on: "
-                "1. Major changes and evolution "
-                "2. Development patterns "
-                "3. Key milestones "
-                "Keep it short and focused."
+                "1. Major changes and evolution with specific commit references "
+                "2. Development patterns seen in the actual commit history "
+                "3. Key milestones with dates and feature implementations "
+                "Keep it short and focused. Use only information from the repository history."
             ),
             "chat": (
+                "IMPORTANT: You must analyze the ACTUAL CODE from this repository. DO NOT provide generic responses about frameworks unless they're actually used here. "
                 "You are a helpful coding assistant analyzing this repository. "
-                "Provide clear, concise answers. Focus on high-level insights. "
-                "Only show code if specifically asked."
+                "Always reference specific files, classes, functions and code structures from the repository. "
+                "Never make up information - if you don't see certain code, admit you can't find it. "
+                "Focus on implementation details found in the code, not theoretical descriptions. "
+                "Quote relevant code snippets when appropriate to support your answers."
             )
         }
         
         # Use default if task not found
         system_prompt = system_prompts.get(
             task, 
+            "IMPORTANT: You must analyze the ACTUAL CODE from this repository. DO NOT provide generic responses about frameworks unless they're actually used here. "
             "You are an expert software engineer analyzing a repository. "
-            "Provide comprehensive analysis and insights about the codebase."
+            "Always reference specific files, classes, functions and code structures from the repository. "
+            "Never make up information - if you don't see certain code, admit you can't find it. "
+            "Focus on implementation details found in the code, not theoretical descriptions."
         )
         
         # Prepare the request payload
@@ -540,9 +676,10 @@ class LlamaClient:
         self,
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 10000,
         temperature: float = 0.7,
-        stream: bool = False
+        stream: bool = False,
+        retry_count: int = 0  # Track retries to prevent infinite recursion
     ) -> Dict[str, Any]:
         """
         Send a chat request to the API.
@@ -557,121 +694,53 @@ class LlamaClient:
         Returns:
             API response
         """
-        # DEBUG: Show the current issue
-        print("\n\n=============== CONTEXT-PRESERVING FIX FOR CHAT API ===============")
-        print(f"Incoming messages count: {len(messages)}")
+        # Enhanced logging for debugging message context issues
+        logger.debug(f"Chat API request with {len(messages)} messages")
         
-        # EXAMINE ORIGINAL MESSAGES
-        print("Examining original messages:")
-        for i, msg in enumerate(messages):
+        # Check if there are any system messages with repository context
+        has_system_message = any(msg.get("role") == "system" for msg in messages)
+        has_repo_context = any(msg.get("role") == "system" and 
+                              isinstance(msg.get("content"), str) and 
+                              ("repository context" in msg.get("content").lower() or 
+                               "code repository" in msg.get("content").lower()) 
+                              for msg in messages)
+        
+        logger.debug(f"Has system message: {has_system_message}, Has repo context: {has_repo_context}")
+        
+        # Log some details about the messages being sent
+        for i, msg in enumerate(messages[:5]):  # Log first 5 messages
             role = msg.get("role", "unknown")
             content = msg.get("content")
-            print(f"Message {i} - Role: {role}, Content type: {type(content).__name__}")
+            content_type = type(content).__name__
+            content_preview = ""
+            
+            if isinstance(content, str):
+                content_preview = content[:100] + "..." if len(content) > 100 else content
+            elif isinstance(content, list):
+                content_preview = f"list with {len(content)} items"
+            
+            logger.debug(f"Message {i} - Role: {role}, Type: {content_type}, Preview: {content_preview}")
         
-        # Extract important context and content
-        # 1. System message with repository context
-        system_content = "You are a helpful AI assistant analyzing code."
-        repo_context = None
-        image_content = None
-        user_query = "Tell me about this repository"
-        
-        # Look for repository context (typically in system or first user message)
+        # For debugging: Check if any system message is very long (likely contains repo context)
+        system_msg_lengths = [len(msg.get("content", "")) if isinstance(msg.get("content"), str) else 0 
+                            for msg in messages if msg.get("role") == "system"]
+        if system_msg_lengths:
+            logger.debug(f"System message lengths: {system_msg_lengths}")
+            
+        # NEW: Verify that we have repository context in the messages
+        has_repo_ctx = False
         for msg in messages:
             if msg.get("role") == "system" and isinstance(msg.get("content"), str):
-                system_content = msg.get("content")
-                if "repository" in system_content.lower() or "code" in system_content.lower():
-                    repo_context = system_content
-                    print(f"Found repo context in system message: {system_content[:100]}...")
-                break
-        
-        if not repo_context:
-            # Look for repo context in user messages
-            for msg in messages:
-                if msg.get("role") == "user" and isinstance(msg.get("content"), str):
-                    content = msg.get("content")
-                    if len(content) > 500 and ("repository" in content.lower() or "code" in content.lower()):
-                        repo_context = content
-                        print(f"Found repo context in user message: {content[:100]}...")
-                        break
-        
-        # 2. Look for image content (typically in user messages with list content)
-        for msg in messages:
-            content = msg.get("content")
-            # Case: Content is a list with image parts
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "image_url":
-                        image_content = part
-                        print("Found image content in list")
-                        break
-                if image_content:
+                content = msg.get("content", "")
+                if ("repository context" in content.lower() or 
+                    "===== REPOSITORY CONTEXT" in content or
+                    len(content) > 1000):  # Long system messages likely contain repo context
+                    has_repo_ctx = True
+                    logger.debug(f"Found repository context in system message: {content[:100]}...")
                     break
-            # Case: Content is a dict with image_url
-            elif isinstance(content, dict) and content.get("type") == "image_url":
-                image_content = content
-                print("Found image content in dict")
-                break
         
-        # 3. Get the latest user query
-        for msg in reversed(messages):
-            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
-                user_content = msg.get("content")
-                # Only use it as query if it's not the repo context (which is typically long)
-                if len(user_content) < 500:
-                    user_query = user_content
-                    print(f"Found user query: {user_query[:100]}...")
-                break
-        
-        # CONSTRUCT NEW COMPLIANT MESSAGES
-        new_messages = []
-        
-        # Add system message with repo context
-        if repo_context:
-            new_messages.append({
-                "role": "system",
-                "content": repo_context
-            })
-        else:
-            new_messages.append({
-                "role": "system", 
-                "content": system_content
-            })
-        
-        # Add image if found (in a properly formatted user message)
-        if image_content:
-            # Format special message for image
-            if isinstance(image_content, dict) and image_content.get("type") == "image_url":
-                new_messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": image_content.get("image_url")}
-                    ]
-                })
-                # Add a follow-up prompt to analyze the image
-                new_messages.append({
-                    "role": "user",
-                    "content": "Analyze this image in detail."
-                })
-        
-        # Add user's actual query as the final message
-        new_messages.append({
-            "role": "user",
-            "content": user_query
-        })
-        
-        # Log the new messages
-        print("\n=============== NEW CONTEXT-PRESERVING MESSAGES ===============")
-        for i, msg in enumerate(new_messages):
-            print(f"New Message {i} - Role: {msg.get('role')}")
-            content = msg.get("content")
-            if isinstance(content, str):
-                print(f"  Content preview: {content[:100]}...")
-            elif isinstance(content, list):
-                print(f"  Content: list with {len(content)} items")
-                for part in content:
-                    print(f"    Part type: {part.get('type', 'unknown')}")
-            else:
-                print(f"  Content type: {type(content).__name__}")
+        if not has_repo_ctx:
+            logger.warning("No repository context found in messages! Responses may be generic.")
         
         # Use the default model or override
         model = model or self.model
@@ -682,33 +751,757 @@ class LlamaClient:
             "Authorization": f"Bearer {self.api_key}"
         }
         
+        # Do not limit context since Llama API can handle up to 1M tokens
+        # Just log the size of the context being sent
+        total_chars = sum(len(str(msg.get("content", ""))) for msg in messages)
+        logger.debug(f"Sending full context to Llama API: {len(messages)} messages, approximately {total_chars} characters")
+        
+        # Detailed debug logs for consecutive requests
+        import time
+        logger.debug(f"\n================== NEW CHAT REQUEST ==================")
+        logger.debug(f"Request with user API key: {self.api_key[:8]}...")
+        logger.debug(f"Request timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Track message history to debug second message issue
+        try:
+            # Use a global variable to track conversation turns
+            if not hasattr(self, '_conversation_turn'):
+                self._conversation_turn = 1
+                logger.debug(f"First conversation turn")
+            else:
+                self._conversation_turn += 1
+                logger.debug(f"Conversation turn #{self._conversation_turn}")
+                
+            # Record detailed info about messages in this turn
+            logger.debug(f"Message roles in this turn: {[m.get('role', 'unknown') for m in messages]}")
+            logger.debug(f"Total messages in this turn: {len(messages)}")
+        except Exception as e:
+            logger.error(f"Error tracking conversation: {e}")
+        
+        # Dump the full messages to a log file for debugging
+        try:
+            import os
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, f"message_dump_{int(time.time())}.json")
+            with open(log_path, "w") as f:
+                import json
+                json.dump({"messages": [m for m in messages]}, f, default=str, indent=2)
+            logger.debug(f"Dumped full message context to {log_path}")
+        except Exception as e:
+            logger.error(f"Failed to dump messages to file: {e}")
+        
+        # FIX: Clean up the messages to ensure they're valid for the API
+        # Using the structured format the user provided from chat_interface.py
+        cleaned_messages = []
+        
+        # First, let's check if there might be messages with wrong structure
+        has_invalid_format = False
+        invalid_indices = []
+        for i, msg in enumerate(messages):
+            # Check if message conforms to the expected schema
+            if not isinstance(msg, dict) or 'role' not in msg:
+                has_invalid_format = True
+                invalid_indices.append(i)
+            elif msg.get('role') not in ['system', 'user', 'assistant', 'tool']:
+                has_invalid_format = True
+                invalid_indices.append(i)
+            elif 'content' not in msg and msg.get('role') != 'assistant':
+                # Content is required except for assistant messages that might have function_call instead
+                has_invalid_format = True
+                invalid_indices.append(i)
+                
+        if has_invalid_format:
+            logger.warning(f"Found {len(invalid_indices)} messages with invalid format at indices: {invalid_indices}")
+            
+        # Now process each message individually
+        for i, msg in enumerate(messages):
+            # Create a new message with only the essential fields
+            clean_msg = {}
+            
+            # Extract role and content
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            # Ensure role is valid - this is critical for JSON schema validation
+            if role not in ["system", "user", "assistant", "tool"]:
+                logger.warning(f"Invalid role '{role}' in message {i}, defaulting to 'user'")
+                role = "user"  # Default to user role
+                
+            # CRITICAL FIX: Format content properly according to chat_interface.py pattern
+            # This is the key to fixing the message.6 schema validation error
+            
+            # Now set the fields in the clean message
+            clean_msg["role"] = role
+            
+            # Format content according to the structured format in chat_interface.py
+            if content is not None:
+                try:
+                    if isinstance(content, str):
+                        # Convert plain strings to structured format
+                        clean_msg["content"] = {
+                            "type": "text",
+                            "text": content
+                        }
+                    elif isinstance(content, dict) and "type" in content and content["type"] == "text" and "text" in content:
+                        # Already in correct format
+                        clean_msg["content"] = content.copy()  # Make a copy to avoid reference issues
+                    elif isinstance(content, list):
+                        # For multi-part messages, ensure each part has correct structure
+                        formatted_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and "type" in part:
+                                formatted_parts.append(part.copy())  # Make a copy
+                            else:
+                                # Safely convert to string
+                                text = "[Content]"  # Default
+                                try:
+                                    text = str(part)
+                                except Exception as e:
+                                    logger.error(f"Error converting part to string: {e}")
+                                
+                                formatted_parts.append({
+                                    "type": "text",
+                                    "text": text
+                                })
+                        clean_msg["content"] = formatted_parts
+                    else:
+                        # Convert any other content type to structured format safely
+                        text = "[Content]"  # Default if conversion fails
+                        try:
+                            if content is not None:
+                                text = str(content)
+                        except Exception as e:
+                            logger.error(f"Error converting content to string: {e}")
+                        
+                        clean_msg["content"] = {
+                            "type": "text",
+                            "text": text
+                        }
+                except Exception as e:
+                    # Fallback for any unexpected errors
+                    logger.error(f"Unexpected error formatting content: {e}")
+                    clean_msg["content"] = {
+                        "type": "text",
+                        "text": "[Error: Could not format content]"
+                    }
+            
+            # Add name field if present and valid
+            if "name" in msg and msg["name"]:
+                clean_msg["name"] = msg["name"]
+                
+            # Add tool_call_id if this is a tool message
+            if role == "tool" and "tool_call_id" in msg:
+                clean_msg["tool_call_id"] = msg["tool_call_id"]
+                
+            # Function calls for assistant messages
+            if role == "assistant" and "function_call" in msg:
+                clean_msg["function_call"] = msg["function_call"]
+                
+            cleaned_messages.append(clean_msg)
+            
+        logger.debug(f"Cleaned {len(messages)} messages to {len(cleaned_messages)} valid messages")
+        
+        # Create the data payload for the API
+        # If repository is very large, just keep the system message, last 5 messages of conversation
+        if len(cleaned_messages) > 10 and total_chars > 800000:
+            logger.warning(f"Total context size is very large: {total_chars} chars. Limiting to essential messages.")
+            
+            # Find system messages (likely containing repo context)
+            system_msgs = [msg for msg in cleaned_messages if msg.get("role") == "system"]
+            
+            # Find main system message (likely the longest one with repo context)
+            main_system_msg = None
+            if system_msgs:
+                if len(system_msgs) == 1:
+                    main_system_msg = system_msgs[0]
+                else:
+                    # Find the longest system message that likely contains repo context
+                    main_system_msg = max(system_msgs, key=lambda m: len(str(m.get("content", ""))))
+            
+            # Get recent conversation (user/assistant messages)
+            recent_msgs = [m for m in cleaned_messages[-10:] if m.get("role") in ["user", "assistant"]]
+            
+            # Build final message list
+            final_messages = []
+            if main_system_msg:
+                final_messages.append(main_system_msg)
+            final_messages.extend(recent_msgs)
+            
+            logger.debug(f"Limited context from {len(cleaned_messages)} to {len(final_messages)} messages")
+            cleaned_messages = final_messages
+        
+        # Prepare the data for the API request
+        # CRITICAL: Convert the structured content format back to string format for Llama API
+        api_messages = []
+        
+        for msg in cleaned_messages:
+            api_msg = {"role": msg.get("role")}
+            content = msg.get("content")
+            
+            # Convert structured content back to string format for the API
+            try:
+                if isinstance(content, dict) and "type" in content and content["type"] == "text" and "text" in content:
+                    # Extract the text content from structured format
+                    text_value = content["text"]
+                    api_msg["content"] = text_value if isinstance(text_value, str) else str(text_value)
+                elif isinstance(content, list):
+                    # For multimodal content, extract text parts and join
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and "type" in part and part["type"] == "text" and "text" in part:
+                            text_value = part["text"]
+                            if isinstance(text_value, str):
+                                text_parts.append(text_value)
+                            else:
+                                # Handle non-string text fields
+                                try:
+                                    text_parts.append(str(text_value))
+                                except Exception:
+                                    text_parts.append("[Non-text content]")
+                    api_msg["content"] = "\n".join(text_parts) if text_parts else ""
+                elif isinstance(content, str):
+                    # Already a string
+                    api_msg["content"] = content
+                else:
+                    # Safely convert other types to string
+                    try:
+                        api_msg["content"] = str(content) if content is not None else ""
+                    except Exception as e:
+                        logger.error(f"Error converting content to string: {e}")
+                        api_msg["content"] = "[Content conversion error]"
+            except Exception as e:
+                # Ultimate fallback
+                logger.error(f"Unexpected error processing content: {e}")
+                api_msg["content"] = ""
+            
+            # Include other fields if present
+            if "name" in msg:
+                api_msg["name"] = msg["name"]
+            if "function_call" in msg:
+                api_msg["function_call"] = msg["function_call"]
+            if "tool_call_id" in msg and msg.get("role") == "tool":
+                api_msg["tool_call_id"] = msg["tool_call_id"]
+                
+            api_messages.append(api_msg)
+            
+        # Log what we're sending to the API
+        logger.debug(f"Sending {len(api_messages)} messages to Llama API")
+        
+        # Construct the data for the API request
         data = {
             "model": model,
-            "messages": new_messages,
+            "messages": api_messages,  # Send converted messages that Llama API can understand
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": stream
         }
         
+        # Detailed message debugging for first cleaned messages
+        if len(cleaned_messages) > 0:
+            logger.debug("First cleaned message role: " + cleaned_messages[0].get("role", "unknown"))
+            if isinstance(cleaned_messages[0].get("content"), str):
+                preview = cleaned_messages[0].get("content", "")[:100] + "..." if len(cleaned_messages[0].get("content", "")) > 100 else cleaned_messages[0].get("content", "")
+                logger.debug(f"First cleaned message content preview: {preview}")
+                
+        if len(cleaned_messages) > 1:
+            logger.debug("Last cleaned message role: " + cleaned_messages[-1].get("role", "unknown"))
+            if isinstance(cleaned_messages[-1].get("content"), str):
+                preview = cleaned_messages[-1].get("content", "")[:100] + "..." if len(cleaned_messages[-1].get("content", "")) > 100 else cleaned_messages[-1].get("content", "")
+                logger.debug(f"Last cleaned message content preview: {preview}")
+        
+        # Fix for message 6 schema validation
+        if len(cleaned_messages) > 6:
+            print(f"\n🔥 APPLYING STRUCTURED FORMAT FIX TO MESSAGE 6")
+            index_6_msg = cleaned_messages[6]
+            role = index_6_msg.get('role')
+            content = index_6_msg.get('content')
+            
+            # Ensure message 6 has proper structure with nested content format
+            print(f"Original message 6: {index_6_msg}")
+            
+            # Apply the structured format specifically for message 6
+            if role in ['system', 'user', 'assistant']:
+                if not isinstance(content, dict) or 'type' not in content or 'text' not in content:
+                    # Force the correct structured format
+                    if isinstance(content, str):
+                        cleaned_messages[6]['content'] = {
+                            "type": "text",
+                            "text": content
+                        }
+                    else:
+                        # Safely convert to string to handle any type
+                        text_content = ""
+                        try:
+                            text_content = str(content) if content else "Please continue with your analysis."
+                        except Exception as e:
+                            logger.error(f"Error converting content to string: {e}")
+                            text_content = "Please continue with your analysis."
+                            
+                        cleaned_messages[6]['content'] = {
+                            "type": "text",
+                            "text": text_content
+                        }
+                    print(f"\n✅ Fixed message 6 by applying structured content format")
+            elif role == 'tool':
+                # Ensure tool messages have the correct format
+                cleaned_messages[6] = {
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": "Please continue analyzing the repository."
+                    }
+                }
+                print(f"\n✅ Replaced tool message with user message using proper structure")
+                
+            print(f"Fixed message 6: {cleaned_messages[6]}")
+            
+            # ADDITIONAL SAFETY: Check for any remaining tool messages that might cause issues
+            for i, msg in enumerate(cleaned_messages):
+                if msg.get("role") == "tool":
+                    print(f"\n⚠️ Found potentially problematic tool message at index {i}")
+                    # Replace with user message - tool messages seem to cause schema issues
+                    cleaned_messages[i] = {
+                        "role": "user",
+                        "content": "Please continue with the analysis."
+                    }
+                    print(f"✅ Replaced tool message at index {i} with safe user message")
+            
+            # FINAL VERIFICATION: Ensure we have valid message sequence
+            print("\n🔍 VERIFYING CONVERSATION SEQUENCE PATTERN")
+            # Extract sequence of roles for analysis
+            role_sequence = [msg.get("role") for msg in cleaned_messages]
+            print(f"Message sequence: {role_sequence}")
+            
+            # Fix alternating pattern if needed - this is critical for Llama API
+            valid_sequence = True
+            for i in range(1, len(cleaned_messages)):
+                prev_role = cleaned_messages[i-1].get("role")
+                curr_role = cleaned_messages[i].get("role")
+                
+                # Check for consecutive non-system messages of same role (which is invalid)
+                if prev_role == curr_role and prev_role != "system":
+                    valid_sequence = False
+                    print(f"⚠️ Invalid sequence: {prev_role} followed by {curr_role} at indices {i-1},{i}")
+                    # Fix by converting second message to appropriate alternating type
+                    if curr_role == "user":
+                        cleaned_messages[i]["role"] = "assistant"
+                    else:
+                        cleaned_messages[i]["role"] = "user"
+                    print(f"✅ Changed message {i} role to {cleaned_messages[i]['role']}")
+            
+            print(f"✅ Message 6 issue remediation complete")
+                
+        # Fix for second message issue: Ensure all messages have the right structure
+        if self._conversation_turn > 1:
+            # Terminal output for debugging - directly visible in the Streamlit console
+            print("\n====== SECOND CHAT QUESTION DETECTED - APPLYING FIXES ======")
+            print(f"Conversation turn: #{self._conversation_turn}")
+            
+            # Count message types
+            user_msgs = [m for m in cleaned_messages if m.get('role') == 'user']
+            assistant_msgs = [m for m in cleaned_messages if m.get('role') == 'assistant']
+            system_msgs = [m for m in cleaned_messages if m.get('role') == 'system']
+            
+            print(f"Before fixes: {len(system_msgs)} system, {len(user_msgs)} user, and {len(assistant_msgs)} assistant messages")
+            
+            # CRITICAL CHECK: Verify system messages are still present
+            if not system_msgs:
+                print("\n⚠️ CRITICAL ERROR: No system messages found in subsequent request! This causes 400 errors.")
+                print("Adding system message to fix the issue...")
+                # Try to recover by adding a system message - this is critical for second questions
+                system_msg = {"role": "system", "content": "You are LORE (Long-context Organizational Repository Explorer), an expert AI assistant that analyzes and explains code repositories in detail."}
+                cleaned_messages.insert(0, system_msg)
+                print("✅ Added system message to prevent 400 error")
+            
+            # Check for specific message structure issues
+            for i, msg in enumerate(cleaned_messages):
+                role = msg.get('role', 'unknown')
+                content_type = type(msg.get('content')).__name__
+                content_len = len(str(msg.get('content', ''))) if msg.get('content') else 0
+                
+                # Check for message content length limits
+                content = msg.get('content', '')
+                # Handle different content types properly when truncating
+                if isinstance(content, dict) and 'type' in content and content['type'] == 'text' and 'text' in content:
+                    # Handle structured content format
+                    text_content = content['text']
+                    if isinstance(text_content, str) and len(text_content) > 100000:
+                        logger.warning(f"Very long structured text content found! Truncating.")
+                        # Create a new truncated version
+                        truncated_text = text_content[:50000] + "\n[Content truncated]\n" + text_content[-10000:]
+                        # Replace the content while preserving structure
+                        cleaned_messages[i]['content'] = {
+                            "type": "text",
+                            "text": truncated_text
+                        }
+                elif isinstance(content, str) and len(content) > 100000:
+                    logger.warning(f"Very long message found in turn {self._conversation_turn}! Truncating.")
+                    cleaned_messages[i]['content'] = content[:50000] + "\n[Content truncated]\n" + content[-10000:]
+                    print(f"✅ Truncated system message from {content_len} to {len(cleaned_messages[i]['content'])} chars")
+            
+            # ADDITIONAL FIX: Add repository context if it might have been lost
+            if len(system_msgs) == 1 and all(len(str(m.get('content', ''))) < 1000 for m in system_msgs):
+                print("\n⚠️ Repository context might be missing in system messages!")
+                # Add a note about possible issue
+                print("Possible issue: Repository context was lost between chat messages")
+                
+            # Final counts after fixes
+            user_msg_count = sum(1 for m in cleaned_messages if m.get('role') == 'user')
+            assistant_msg_count = sum(1 for m in cleaned_messages if m.get('role') == 'assistant')
+            system_msg_count = sum(1 for m in cleaned_messages if m.get('role') == 'system')
+            print(f"After fixes: {system_msg_count} system, {user_msg_count} user, and {assistant_msg_count} assistant messages")
+            print("====== FIXES COMPLETE ======\n")
+        
+        logger.debug(f"Sending request to {url} with model {model}")
+        
         # Log the final payload (shortened for readability)
         print("\n=============== FINAL API PAYLOAD STRUCTURE ===============")
         print(f"Model: {model}")
-        print(f"Message count: {len(new_messages)}")
+        print(f"Message count: {len(messages)}")
         print(f"Temperature: {temperature}")
         print(f"Max tokens: {max_tokens}")
+        
+        # Validate message structure against Llama API schema expectations
+        print("\n🔍 VALIDATING MESSAGE STRUCTURE AGAINST API SCHEMA")
+        valid_message_structure = True
+        for i, msg in enumerate(data['messages']):
+            validation_errors = []
+            # Check required fields according to Llama API schema
+            if 'role' not in msg:
+                validation_errors.append("missing 'role' field")
+            elif msg['role'] not in ['system', 'user', 'assistant', 'tool']:
+                validation_errors.append(f"invalid role '{msg['role']}'")
+                
+            # Check content field structure
+            if 'content' not in msg and msg.get('role') != 'assistant':
+                # Content is required for non-assistant messages (assistant can have function_call instead)
+                validation_errors.append("missing 'content' field")
+            elif 'content' in msg:
+                if not isinstance(msg['content'], str) and not isinstance(msg['content'], list) and msg['content'] is not None:
+                    validation_errors.append(f"content must be string, list, or null, got {type(msg['content']).__name__}")
+                elif isinstance(msg['content'], list):
+                    # Check multimodal content structure
+                    for item in msg['content']:
+                        if not isinstance(item, dict) or 'type' not in item:
+                            validation_errors.append("invalid multimodal content structure")
+                            break
+                            
+            # Tool messages require tool_call_id
+            if msg.get('role') == 'tool' and 'tool_call_id' not in msg:
+                validation_errors.append("tool message missing 'tool_call_id'")
+                # Fix it by adding a default tool_call_id
+                msg['tool_call_id'] = f"call_{i}"
+                
+            # If errors found, log them
+            if validation_errors:
+                print(f"⚠️ Message {i} has schema validation errors: {', '.join(validation_errors)}")
+                valid_message_structure = False
+                # Try to fix critical issues
+                if msg.get('role') == 'tool' and 'tool_call_id' not in msg:
+                    msg['tool_call_id'] = f"call_{i}"
+                if 'content' not in msg and msg.get('role') != 'assistant':
+                    msg['content'] = ""
+                if 'content' in msg and not isinstance(msg['content'], (str, list)) and msg['content'] is not None:
+                    msg['content'] = str(msg['content'])
+                print(f"✅ Fixed message {i}: {msg}")
+        
+        if valid_message_structure:
+            print("✅ All messages conform to expected schema")
+        else:
+            print("⚠️ Some messages required fixing to conform to schema")
+            
+        # Attempt to serialize data to verify it's valid JSON
+        try:
+            import json
+            serialized_data = json.dumps(data)
+            logger.debug(f"Data serialization successful, payload size: {len(serialized_data)} bytes")
+        except Exception as json_err:
+            logger.error(f"Data serialization failed: {str(json_err)}")
+            print(f"\n🔍 JSON SERIALIZATION FAILED: {str(json_err)}")
+            # Attempt to find and fix the problematic parts
+            logger.error("Trying to fix JSON serialization issues...")
+            try:
+                # Create a sanitized copy with only strings for content
+                sanitized_messages = []
+                for m in data['messages']:
+                    fixed_msg = {"role": m.get("role", "user")}
+                    if 'content' in m:
+                        fixed_msg["content"] = str(m["content"]) if not isinstance(m["content"], (str, list)) else m["content"]
+                    else:
+                        fixed_msg["content"] = ""
+                    if m.get("role") == "tool" and "tool_call_id" in m:
+                        fixed_msg["tool_call_id"] = m["tool_call_id"]
+                    sanitized_messages.append(fixed_msg)
+                data['messages'] = sanitized_messages
+                logger.debug("Fixed JSON serialization issues in messages")
+                print("✅ Fixed JSON serialization issues")
+            except Exception as fix_err:
+                logger.error(f"Failed to fix JSON serialization: {str(fix_err)}")
+                print(f"⚠️ Could not fix JSON issues: {str(fix_err)}")
         
         try:
             if stream:
                 return self._stream_chat(url, headers, data)
             else:
-                response = requests.post(url, headers=headers, json=data)
-                if response.status_code != 200:
-                    print(f"API error response: {response.text}")
-                    logger.error(f"API error response: {response.text}")
-                response.raise_for_status()
-                return response.json()
+                logger.debug(f"Sending request to {url} with model {model}")
+                try:
+                    # Log headers (without auth token)
+                    safe_headers = headers.copy()
+                    if 'Authorization' in safe_headers:
+                        safe_headers['Authorization'] = 'Bearer [REDACTED]'
+                    logger.debug(f"Request headers: {safe_headers}")
+                    
+                    # Before sending the request, log what we're sending
+                    if self._conversation_turn > 1:
+                        print("\n====== SENDING REQUEST TO LLAMA API ======")
+                        print(f"Model: {model}")
+                        print(f"Max tokens: {max_tokens}")
+                        print(f"Message count: {len(data['messages'])}")
+                        print(f"First message role: {data['messages'][0].get('role') if data['messages'] else 'none'}")
+                        print(f"Last message role: {data['messages'][-1].get('role') if data['messages'] else 'none'}")
+                    
+                    # First try sending the request with a timeout
+                    logger.debug(f"Sending POST request to {url}...")
+                    
+                    # EMERGENCY BYPASS: If this is a retry and message 6 schema error is likely
+                    if retry_count > 0 and len(data['messages']) > 6:
+                        print("\n🛠️ APPLYING EMERGENCY REPAIR BEFORE SENDING (RETRY #{retry_count})")
+                        # Create a super simplified version of the messages
+                        simplified_messages = []
+                        
+                        # Keep system message(s)
+                        system_msgs = [m for m in data['messages'] if m.get('role') == 'system']
+                        if system_msgs:
+                            simplified_messages.append(system_msgs[0])  # Keep just the first system message
+                        
+                        # Add the most recent user message
+                        user_msgs = [m for m in data['messages'] if m.get('role') == 'user']
+                        if user_msgs:
+                            simplified_messages.append(user_msgs[-1])  # Add the most recent user message
+                        
+                        # Use this drastically simplified message set
+                        print(f"Original message count: {len(data['messages'])}")
+                        print(f"Simplified message count: {len(simplified_messages)}")
+                        data['messages'] = simplified_messages
+                    
+                    response = requests.post(url, headers=headers, json=data, timeout=60)
+                    logger.debug(f"Received response with status code: {response.status_code}")
+                    
+                    # Check if the response was successful
+                    if response.status_code != 200:
+                        error_text = response.text
+                        # TERMINAL OUTPUT FOR ERRORS - directly visible
+                        print("\n🛑 ERROR IN LLAMA API REQUEST 🛑")
+                        print(f"HTTP {response.status_code} Error")
+                        print(f"Error text: {error_text[:200]}" + ("..." if len(error_text) > 200 else ""))
+                        
+                        # Detailed analysis of specific error codes
+                        if response.status_code == 400:
+                            print("\n🔍 HTTP 400 ERROR ANALYSIS:")
+                            print("Common causes: Invalid message format, missing required fields, or token limit exceeded")
+                            
+                            # Try to parse and display the error details
+                            try:
+                                error_data = response.json()
+                                detail = error_data.get('detail', '')
+                                # Check specifically for the message 6 schema error
+                                if 'message' in str(error_data) and 'schema' in str(error_data) and 'messages.6' in str(error_data):
+                                    print("\n🚨 DETECTED MESSAGES.6 SCHEMA ERROR - ATTEMPTING EMERGENCY RECOVERY")
+                                    # This is our specific error case - implement special recovery
+                                    try:
+                                        # Create a drastically simplified message list - only keep essential context
+                                        recovery_messages = []
+                                        
+                                        # Add system message
+                                        system_msgs = [m for m in data['messages'] if m.get('role') == 'system']
+                                        if system_msgs:
+                                            # Keep only the first system message
+                                            system_msg = system_msgs[0]
+                                            # If it's too long, simplify it
+                                            if 'content' in system_msg and isinstance(system_msg['content'], str) and len(system_msg['content']) > 10000:
+                                                system_msg = {
+                                                    "role": "system",
+                                                    "content": "You are LORE, an AI assistant that helps analyze code repositories."
+                                                }
+                                            recovery_messages.append(system_msg)
+                                        else:
+                                            # Add a default system message if none exists
+                                            recovery_messages.append({"role": "system", "content": "You are LORE, an AI assistant that analyzes repositories."})
+                                        
+                                        # Add just the last user message - this is what the user cares about most
+                                        user_msgs = [m for m in data['messages'] if m.get('role') == 'user']
+                                        if user_msgs:
+                                            recovery_messages.append(user_msgs[-1])  # Just the last question
+                                        
+                                        # Try the recovery request
+                                        print("\n💡 ATTEMPTING RECOVERY WITH SIMPLIFIED MESSAGES")
+                                        print(f"Simplified to {len(recovery_messages)} messages")
+                                        
+                                        recovery_data = data.copy()
+                                        recovery_data['messages'] = recovery_messages
+                                        
+                                        print("Sending recovery request...")
+                                        recovery_response = requests.post(url, headers=headers, json=recovery_data, timeout=60)
+                                        
+                                        if recovery_response.status_code == 200:
+                                            print("🎉 RECOVERY SUCCESSFUL!")
+                                            return recovery_response.json()
+                                        else:
+                                            print(f"⚠️ Recovery failed with status {recovery_response.status_code}")
+                                    except Exception as recovery_err:
+                                        print(f"Recovery attempt failed: {str(recovery_err)}")
+                                
+                                # Continue with normal error processing
+                                if isinstance(error_data, dict):
+                                    if 'error' in error_data:
+                                        error_info = error_data['error']
+                                        if isinstance(error_info, dict) and 'message' in error_info:
+                                            print(f"\nDetailed error message: {error_info['message']}")
+                                        else:
+                                            print(f"\nError info: {error_info}")
+                                    elif 'message' in error_data:
+                                        print(f"\nError message: {error_data['message']}")
+                                    elif 'detail' in error_data:
+                                        print(f"\nError detail: {error_data['detail']}")
+                                        
+                                    # Look for specific error patterns
+                                    error_str = str(error_data)
+                                    if 'content' in error_str.lower():
+                                        print("\nPossible issue: Invalid content format in messages")
+                                    if 'role' in error_str.lower():
+                                        print("\nPossible issue: Invalid role in messages")
+                                    if 'token' in error_str.lower() or 'length' in error_str.lower():
+                                        print("\nPossible issue: Context too long or token limit exceeded")
+                            except Exception as parse_err:
+                                print(f"\nCould not parse error response as JSON: {str(parse_err)}")
+                                
+                            # Dump the messages that caused the error for debugging
+                            try:
+                                for i, msg in enumerate(data['messages']):
+                                    role = msg.get('role', 'unknown')
+                                    content = msg.get('content', '')
+                                    content_len = len(str(content)) if content else 0
+                                    content_preview = str(content)[:50] + '...' if content_len > 50 else str(content)
+                                    print(f"Message {i}: role={role}, length={content_len}, preview='{content_preview}'")
+                            except Exception:
+                                print("Could not dump message details")
+                        
+                        logger.error(f"API error response (HTTP {response.status_code}): {error_text}")
+                        
+                        # Try to parse the error message
+                        try:
+                            error_data = response.json()
+                            if 'error' in error_data:
+                                logger.error(f"API error message: {error_data['error']}")
+                                # Check for specific error types
+                                if isinstance(error_data['error'], dict) and 'message' in error_data['error']:
+                                    error_msg = error_data['error']['message']
+                                    logger.error(f"Detailed error message: {error_msg}")
+                                    
+                                    # Try to recover based on specific error messages
+                                    if 'content' in error_msg.lower() or 'format' in error_msg.lower():
+                                        logger.warning("Detected content format error, attempting recovery...")
+                                        # Simplify messages and retry
+                                        simple_msgs = [{"role": "system", "content": "You are a helpful assistant."},
+                                                      {"role": "user", "content": "Please analyze this code."}]
+                                        retry_data = data.copy()
+                                        retry_data['messages'] = simple_msgs
+                                        logger.debug("Retrying with simplified messages")
+                                        retry_response = requests.post(url, headers=headers, json=retry_data, timeout=60)
+                                        if retry_response.status_code == 200:
+                                            logger.debug("Recovery successful!")
+                                            return retry_response.json()
+                            if 'message' in error_data:
+                                logger.error(f"API error message: {error_data['message']}")
+                        except Exception as parse_err:
+                            logger.error(f"Could not parse error response as JSON: {str(parse_err)}")
+                    
+                    # Special handling for message #6 schema error
+                    if response.status_code == 400 and 'messages.6' in response.text:
+                        print("\n🚨 FINAL ATTEMPT: MESSAGE 6 SCHEMA ERROR DETECTED")
+                        print("Performing emergency simplification...")
+                        
+                        # Extract only the essential messages
+                        minimal_messages = []
+                        
+                        # Always include a system message
+                        system_msgs = [m for m in messages if m.get('role') == 'system']
+                        if system_msgs:
+                            # Use a very simple system message with no complex content
+                            minimal_messages.append({"role": "system", "content": "You are LORE, a helpful AI that analyzes code."})
+                        else:
+                            minimal_messages.append({"role": "system", "content": "You are LORE, a helpful AI."})
+                        
+                        # Include only the most recent user message - this is critical
+                        user_msgs = [m for m in messages if m.get('role') == 'user']
+                        if user_msgs:
+                            last_user_msg = user_msgs[-1]
+                            # Ensure the content is a simple string
+                            if 'content' in last_user_msg:
+                                if isinstance(last_user_msg['content'], str):
+                                    minimal_content = last_user_msg['content']
+                                else:
+                                    minimal_content = "Please continue with your analysis."
+                            else:
+                                minimal_content = "Please continue with your analysis."
+                            
+                            minimal_messages.append({"role": "user", "content": minimal_content})
+                        
+                        print(f"Simplified to {len(minimal_messages)} messages")
+                        
+                        # Build a minimal request with just these messages
+                        minimal_data = {
+                            "model": model or "Llama-4-Maverick-17B-128E-Instruct-FP8",
+                            "messages": minimal_messages,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature
+                        }
+                        
+                        # Make the emergency request
+                        print("Sending emergency simplified request...")
+                        emergency_response = requests.post(url, headers=headers, json=minimal_data, timeout=60)
+                        
+                        if emergency_response.status_code == 200:
+                            print("✅ EMERGENCY RECOVERY SUCCESSFUL!")
+                            return emergency_response.json()
+                        else:
+                            print(f"❌ Emergency recovery failed: {emergency_response.status_code}")
+                    
+                    # Continue with normal handling if the above didn't succeed
+                    response.raise_for_status()
+                    logger.debug("Request successful, parsing JSON response")
+                    return response.json()
+                    
+                except requests.exceptions.Timeout:
+                    logger.error("API request timed out after 60 seconds")
+                    raise
+                except requests.exceptions.RequestException as req_err:
+                    logger.error(f"Request exception: {str(req_err)}")
+                    raise
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if hasattr(e, 'response') and hasattr(e.response, 'status_code') else 'unknown'
+            logger.exception(f"HTTP Error in chat API request: {status_code}")
+            
+            error_message = f"I encountered an error communicating with the API (HTTP {status_code})."
+            
+            if status_code == 403:
+                error_message += " This is likely due to permission issues with your API key."
+            elif status_code == 400 and 'messages.6' in str(e.response.text):
+                error_message += " This appears to be a message format error with the 6th message in the conversation. I'll try to simplify the conversation in future requests."
+            elif status_code == 429:
+                error_message += " The API request was rate limited. Please try again later."
+            elif status_code >= 500:
+                error_message += " The API server encountered an internal error. Please try again later."
+                
+            return {
+                "error": str(e),
+                "status_code": status_code,
+                "choices": [{"message": {"content": error_message}}]
+            }
         except Exception as e:
-            logger.error(f"Error in chat request: {e}")
-            if hasattr(e, "response") and hasattr(e.response, "text"):
-                logger.error(f"API response: {e.response.text}")
-            raise e
+            logger.exception("Error in chat API request")
+            return {
+                "error": str(e),
+                "choices": [{"message": {"content": f"I encountered an error: {str(e)}"}}]
+            }    

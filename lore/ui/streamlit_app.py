@@ -31,6 +31,16 @@ from lore.utils.image_utils import format_image_for_llama
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# Create a filter to suppress specific Streamlit warnings
+class StreamlitWarningFilter(logging.Filter):
+    def filter(self, record):
+        return not ("missing ScriptRunContext" in record.getMessage() and 
+                    "can be ignored when running in bare mode" in record.getMessage())
+
+# Apply filter to the streamlit logger
+streamlit_logger = logging.getLogger("streamlit")
+streamlit_logger.addFilter(StreamlitWarningFilter())
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -398,20 +408,29 @@ def analyze_repository():
             
             # Now analyze the repository with the context
             task = st.session_state.task
-            with st.spinner(f"Analyzing repository: {task}..."):
-                analysis_result = repo_analyzer.analyze_repository(
-                    context=repository_context,
-                    task=task,
-                    model=st.session_state.model
-                )
-                
-                # Generate the report
-                report = repo_analyzer.generate_report(analysis_result, report_format="markdown")
-                
-                # Store the results
-                st.session_state.analysis_result = analysis_result
-                st.session_state.report = report
+            
+            # For repo_chat, skip the analysis step and just prepare for chat
+            if task == "repo_chat":
+                st.info("Preparing repository for chat without full analysis. You can immediately start chatting with your repository.")
+                st.session_state.report = "Chat mode enabled. Use the Chat tab to interact with your repository."
+                st.session_state.analysis_result = {"summary": "Repository loaded for chat interaction."}
                 st.session_state.repo_context = repository_context
+            else:
+                # For other tasks, perform regular analysis
+                with st.spinner(f"Analyzing repository: {task}..."):
+                    analysis_result = repo_analyzer.analyze_repository(
+                        context=repository_context,
+                        task=task,
+                        model=st.session_state.model
+                    )
+                    
+                    # Generate the report
+                    report = repo_analyzer.generate_report(analysis_result, report_format="markdown")
+                    
+                    # Store the results
+                    st.session_state.analysis_result = analysis_result
+                    st.session_state.report = report
+                    st.session_state.repo_context = repository_context
             
             # Initialize chat with context
             if repository_context:
@@ -434,7 +453,12 @@ def analyze_repository():
             st.session_state.analyzed = True
             
             # Display success message
-            st.success(f"Repository analyzed successfully: {task}")
+            if task == "repo_chat":
+                st.success("Repository ready for chat interaction. Please go to the Chat tab to begin.")
+                # Auto-switch to chat tab
+                st.session_state.active_tab = 2  # Index of the Chat tab
+            else:
+                st.success(f"Repository analyzed successfully: {task}")
             
         except Exception as e:
             st.error(f"Failed to analyze repository: {e}")
@@ -518,10 +542,11 @@ def main():
         st.header("Analysis Task")
         task = st.selectbox(
             "Select Task",
-            ["Architecture Analysis", "Dependency Analysis", "Code Quality Analysis", "Documentation Analysis"],
+            ["Architecture Analysis", "Dependency Analysis", "Code Quality Analysis", "Documentation Analysis", "Repository Chat"],
             index=0 if st.session_state.task == "analyze_architecture" else 
                  (1 if st.session_state.task == "analyze_dependencies" else 
-                 (2 if st.session_state.task == "analyze_quality" else 3)),
+                 (2 if st.session_state.task == "analyze_quality" else 
+                 (3 if st.session_state.task == "analyze_documentation" else 4))),
             key="task_selectbox"
         )
         
@@ -530,7 +555,8 @@ def main():
             "Architecture Analysis": "analyze_architecture",
             "Dependency Analysis": "analyze_dependencies",
             "Code Quality Analysis": "analyze_quality",
-            "Documentation Analysis": "analyze_documentation"
+            "Documentation Analysis": "analyze_documentation",
+            "Repository Chat": "repo_chat"
         }
         st.session_state.task = task_mapping.get(task, "analyze_architecture")
         

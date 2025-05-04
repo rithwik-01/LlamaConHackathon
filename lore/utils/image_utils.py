@@ -106,7 +106,23 @@ def format_image_for_llama(image_path: str) -> List[Dict[str, Any]]:
     if not base64_image:
         return []
     
-    # Format as Llama API expects
+    # Get file extension to determine correct MIME type
+    import os
+    _, ext = os.path.splitext(image_path)
+    ext = ext.lower().lstrip('.')
+    
+    # Set the correct MIME type based on file extension
+    if ext in ('jpg', 'jpeg'):
+        mime_type = 'image/jpeg'
+    elif ext == 'png':
+        mime_type = 'image/png'
+    else:
+        # Default to jpeg if extension is unknown
+        mime_type = 'image/jpeg'
+    
+    logger.debug(f"Using MIME type {mime_type} for image {image_path}")
+    
+    # Format as Llama API expects for the latest API version
     return [
         {
             "type": "text",
@@ -115,7 +131,7 @@ def format_image_for_llama(image_path: str) -> List[Dict[str, Any]]:
         {
             "type": "image_url",
             "image_url": {
-                "url": f"data:image/jpeg;base64,{base64_image}"
+                "url": f"data:{mime_type};base64,{base64_image}"
             }
         }
     ]
